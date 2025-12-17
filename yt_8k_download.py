@@ -1,42 +1,50 @@
 import os
+import subprocess
 import yt_dlp
 
-# ---------- Progress Bar Function ----------
-def progress_hook(d):
-    if d['status'] == 'downloading':
-        total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate')
-        downloaded_bytes = d.get('downloaded_bytes', 0)
-        percentage = (downloaded_bytes / total_bytes * 100) if total_bytes else 0
-        downloaded_mb = downloaded_bytes / (1024 * 1024)
-        total_mb = total_bytes / (1024 * 1024) if total_bytes else 0
-        print(f"\rDownloading: {percentage:3.0f}% [{downloaded_mb:.2f}/{total_mb:.2f} MB]", end='')
-    elif d['status'] == 'finished':
-        print(f"\nDownload completed: {d['filename']}")
-
 # ---------- User Inputs ----------
-video_url = input("Enter YouTube video link: ").strip()
-save_folder = input("Enter folder to save the video: ").strip()
+save_folder = input("Enter folder to save videos: ").strip()
 os.makedirs(save_folder, exist_ok=True)
 
-# ---------- List Available Resolutions ----------
-ydl_opts_list = {'quiet': True}
-with yt_dlp.YoutubeDL(ydl_opts_list) as ydl:
-    info_dict = ydl.extract_info(video_url, download=False)
-formats = info_dict.get('formats', [])
-resolutions = sorted(set([str(f['height']) for f in formats if f.get('height')]))
-print("\nAvailable resolutions:")
-for r in resolutions:
-    print(f"  {r}p")
+video_url = input("Enter YouTube video link: ").strip()
 
-desired_res = input("Enter desired resolution (e.g., 1080): ").strip()
-
-# ---------- yt-dlp Download ----------
-ydl_opts_download = {
-    'format': f'bestvideo[height={desired_res}]+bestaudio/best',
-    'outtmpl': os.path.join(save_folder, '%(title)s.%(ext)s'),
-    'progress_hooks': [progress_hook],
+# ---------- Extract Best Video URL ----------
+ydl_opts = {
+    'format': 'bestvideo+bestaudio/best',
+    'quiet': True,
     'noplaylist': True,
 }
+with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    info = ydl.extract_info(video_url, download=False)
+    # Use the direct URL for the best combined video+audio
+    if 'url' in info:
+        direct_url = info['url']
+        file_name = ydl.prepare_filename(info)
+    else:
+        # Fallback: pick best video+audio streams
+        formats = info.get('formats', [])
+        best_video = max([f for f in formats if f.get('vcodec') != 'none'], key=lambda x: x.get('height', 0))
+        best_audio = max([f for f in formats if f.get('acodec') != 'none'], key=lambda x: f.get('abr', 0))
+        direct_url = best_video['url']
+        file_name = ydl.prepare_filename(info)
 
-with yt_dlp.YoutubeDL(ydl_opts_download) as ydl:
-    ydl.download([video_url])
+# ---------- Save Direct URL to Temporary File ----------
+temp_url_file = os.path.join(save_folder, "aria2_url.txt")
+with open(temp_url_file, 'w') as f:
+    f.write(direct_url + '\n')
+
+# ---------- Download with aria2 ----------
+print(f"\nDownloading '{file_name}' with maximum speed...")
+
+aria2_cmd = [
+    "aria2c",
+    "-i", temp_url_file,       # Input URL file
+    "-d", save_folder,         # Download folder
+    "-x", "16",                # Max connections per server
+    "-s", "16",                # Split file into 16 segments
+    "--continue=true",         # Resume incomplete downloads
+    "--auto-file-renaming=false",
+]
+
+subprocess.run(aria2_cmd)
+print(f"\nDownload completed: {file_name}")
