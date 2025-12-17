@@ -1,113 +1,102 @@
 import os
-import subprocess
 import yt_dlp
-from typing import Dict, List
 
-# ===================== Progress Hook =====================
-def progress_hook(d: Dict):
+# ---------- Progress Hook ----------
+def progress_hook(d):
     if d['status'] == 'downloading':
-        total = d.get('total_bytes') or d.get('total_bytes_estimate')
-        downloaded = d.get('downloaded_bytes', 0)
-        percent = downloaded / total * 100 if total else 0
-        speed = (d.get('speed') or 0) / (1024 * 1024)
+        total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate')
+        downloaded_bytes = d.get('downloaded_bytes', 0)
+        percentage = (downloaded_bytes / total_bytes * 100) if total_bytes else 0
+        downloaded_mb = downloaded_bytes / (1024 * 1024)
+        total_mb = total_bytes / (1024 * 1024) if total_bytes else 0
+        speed = d.get('speed') or 0
+        speed_mb = speed / (1024 * 1024) if speed else 0
         eta = d.get('eta') or 0
 
-        bar_len = 30
-        filled = int(bar_len * percent // 100)
-        bar = '█' * filled + '-' * (bar_len - filled)
+        bar_length = 30
+        filled_length = int(bar_length * percentage // 100)
+        bar = '█' * filled_length + '-' * (bar_length - filled_length)
 
         print(
-            f"\r[{bar}] {percent:5.1f}% | "
-            f"Speed: {speed:5.2f} MB/s | ETA: {eta}s",
+            f"\r[{bar}] {percentage:3.0f}% "
+            f"{downloaded_mb:.2f}/{total_mb:.2f} MB "
+            f"Speed: {speed_mb:.2f} MB/s ETA: {eta}s",
             end=''
         )
+
     elif d['status'] == 'finished':
-        print(f"\n✔ Download finished: {d['filename']}")
+        print(f"\nDownload completed: {d['filename']}")
 
+# ---------- Inputs ----------
+video_url = input("Video link: ").strip()
+save_folder = input("Where to save: ").strip()
+os.makedirs(save_folder, exist_ok=True)
 
-# ===================== User Input =====================
-url = input("Video URL: ").strip()
-out_dir = input("Save directory: ").strip()
-os.makedirs(out_dir, exist_ok=True)
+# ---------- Get Video Info ----------
+ydl_opts_info = {'quiet': True}
+with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
+    info = ydl.extract_info(video_url, download=False)
+    title = info.get('title', 'Unknown Title')
+    formats = info.get('formats', [])
 
-# ===================== Probe Formats (Reliable Highest Detection) =====================
-# Use clients that do NOT require PO Tokens
-probe_opts = {
-    'quiet': True,
-    'extractor_args': {
-        'youtube': {
-            'player_client': ['web', 'tv_embedded', 'web_safari']
-        }
-    }
-}
-
-with yt_dlp.YoutubeDL(probe_opts) as ydl:
-    info = ydl.extract_info(url, download=False)
-
-formats = info.get('formats', [])
-
-# Filter real video formats only (exclude storyboards)
-video_formats = [
-    f for f in formats
-    if f.get('vcodec') not in (None, 'none') and f.get('height')
-]
-
-if not video_formats:
-    raise RuntimeError("No downloadable video formats found")
-
-# Find highest resolution available
-max_height = max(f['height'] for f in video_formats)
-
-print(f"\n✔ Highest available resolution detected: {max_height}p")
-
-# Prefer codec order: AV1 > VP9 > H.264
-codec_priority = ['av01', 'vp9', 'avc1']
-
-selected_codec = None
-for codec in codec_priority:
-    if any(codec in (f.get('vcodec') or '') for f in video_formats):
-        selected_codec = codec
-        break
-
-print(f"✔ Selected codec: {selected_codec.upper()}")
-
-# Detect HDR availability
-hdr_available = any(f.get('dynamic_range') == 'HDR' or f.get('hdr') for f in video_formats)
-print(f"✔ HDR available: {'YES' if hdr_available else 'NO'}")
-
-# ===================== Format Selector =====================
-format_selector = (
-    f"bestvideo[vcodec*={selected_codec}][height={max_height}]/"
-    f"bestvideo[height={max_height}]+bestaudio/best"
+resolutions = sorted(
+    {f['height'] for f in formats if f.get('height')},
+    reverse=True
 )
 
-# ===================== Download Options =====================
-ydl_opts = {
-    'format': format_selector,
-    'outtmpl': os.path.join(out_dir, '%(title)s.%(ext)s'),
-    'merge_output_format': 'mkv',
-    'progress_hooks': [progress_hook],
-    'quiet': True,
-    'noplaylist': True,
+# ---------- Resolution → Codec Loop ----------
+while True:
+    print("\nAvailable resolutions:")
+    for i, res in enumerate(resolutions, 1):
+        print(f"{i}: {res}p")
 
-    # Performance
-    'concurrent_fragment_downloads': 8,
-    'continuedl': True,
-    'retries': 10,
-    'fragment_retries': 10,
+    res_choice = input("Choose resolution (number): ").strip()
 
-    # aria2 for max speed
-    'external_downloader': 'aria2c',
-    'external_downloader_args': ['-x16', '-k1M'],
+    if not (res_choice.isdigit() and 1 <= int(res_choice) <= len(resolutions)):
+        print("Invalid resolution choice. Try again.")
+        continue
 
-    # Same extractor args for actual download
-    'extractor_args': {
-        'youtube': {
-            'player_client': ['web', 'tv_embedded', 'web_safari']
+    desired_res = str(resolutions[int(res_choice) - 1])
+
+    # ---------- Codec Menu ----------
+    while True:
+        print(f"\nSelected resolution: {desired_res}p")
+        print("Select codec:")
+        print("1: AV1 (best quality)")
+        print("2: VP9")
+        print("3: H.264")
+        print("B: Back to resolution menu")
+
+        codec_choice = input("Choose codec: ").strip().lower()
+
+        codec_map = {
+            '1': 'av1',
+            '2': 'vp9',
+            '3': 'avc1'
         }
-    }
-}
 
-# ===================== Download =====================
-with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-    ydl.download([url])
+        if codec_choice == 'b':
+            break
+
+        if codec_choice not in codec_map:
+            print("Invalid codec choice.")
+            continue
+
+        selected_codec = codec_map[codec_choice]
+        print(f"\nDownloading {title}")
+        print(f"Resolution: {desired_res}p | Codec: {selected_codec.upper()}\n")
+
+        # ---------- Download ----------
+        outtmpl = os.path.join(save_folder, '%(title)s.%(ext)s')
+        ydl_opts_download = {
+            'format': f'bestvideo[vcodec*={selected_codec}][height={desired_res}]+bestaudio/best',
+            'outtmpl': outtmpl,
+            'progress_hooks': [progress_hook],
+            'quiet': True,
+            'noplaylist': True,
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts_download) as ydl:
+            ydl.download([video_url])
+
+        exit(0)
