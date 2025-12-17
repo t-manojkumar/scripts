@@ -1,69 +1,93 @@
 import os
-import sys
 import yt_dlp
+from typing import Dict
 
-# ---------- Progress Hook ----------
-def progress_hook(d):
+# ===================== Progress Hook =====================
+def progress_hook(d: Dict):
     if d['status'] == 'downloading':
-        total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate')
-        downloaded_bytes = d.get('downloaded_bytes', 0)
-        percentage = (downloaded_bytes / total_bytes * 100) if total_bytes else 0
-        downloaded_mb = downloaded_bytes / (1024 * 1024)
-        total_mb = total_bytes / (1024 * 1024) if total_bytes else 0
-        speed = d.get('speed') or 0
-        speed_mb = speed / (1024 * 1024) if speed else 0
+        total = d.get('total_bytes') or d.get('total_bytes_estimate')
+        downloaded = d.get('downloaded_bytes', 0)
+        percent = downloaded / total * 100 if total else 0
+        speed = (d.get('speed') or 0) / (1024 * 1024)
         eta = d.get('eta') or 0
 
-        bar_length = 30
-        filled_length = int(bar_length * percentage // 100)
-        bar = '█' * filled_length + '-' * (bar_length - filled_length)
-        eta_str = f"{int(eta)}s" if eta else "Unknown"
-        speed_str = f"{speed_mb:.2f} MB/s" if speed else "Unknown"
+        bar_len = 30
+        filled = int(bar_len * percent // 100)
+        bar = '█' * filled + '-' * (bar_len - filled)
 
-        print(f"\r[{bar}] {percentage:3.0f}% "
-              f"{downloaded_mb:.2f}/{total_mb:.2f} MB "
-              f"Speed: {speed_str} ETA: {eta_str}", end='')
+        print(
+            f"\r[{bar}] {percent:5.1f}% | "
+            f"Speed: {speed:5.2f} MB/s | ETA: {eta}s",
+            end=''
+        )
+
     elif d['status'] == 'finished':
-        print(f"\nDownload completed: {d['filename']}")
-
-# ---------- User Inputs ----------
-video_url = input("Video link: ").strip()
-save_folder = input("Where to save: ").strip()
-os.makedirs(save_folder, exist_ok=True)
-
-# ---------- Get Video Info ----------
-ydl_opts_info = {'quiet': True}
-with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
-    info = ydl.extract_info(video_url, download=False)
-    title = info.get('title', 'Unknown Title')
-    formats = info.get('formats', [])
-
-# ---------- Available Resolutions ----------
-resolutions = sorted({f['height'] for f in formats if f.get('height')}, reverse=True)
-
-# Print in single row
-print("\nAvailable formats to download:")
-res_row = " | ".join([f"{i+1}: {res}p" for i, res in enumerate(resolutions)])
-print(res_row)
-
-choice = input("Choose resolution (number): ").strip()
-if choice.isdigit() and 1 <= int(choice) <= len(resolutions):
-    desired_res = str(resolutions[int(choice) - 1])
-else:
-    desired_res = str(resolutions[0])  # default to highest
+        print(f"\n✔ Download finished: {d['filename']}")
 
 
-print(f"\nVideo Title: {title}\nDownloading in {desired_res}p...\n")
+# ===================== User Input =====================
+url = input("Video URL: ").strip()
+out_dir = input("Save directory: ").strip()
+os.makedirs(out_dir, exist_ok=True)
 
-# ---------- Download ----------
-outtmpl = os.path.join(save_folder, '%(title)s.%(ext)s')
-ydl_opts_download = {
-    'format': f'bestvideo[height={desired_res}]+bestaudio/best',
-    'outtmpl': outtmpl,
+print("\nSelect video codec:")
+print("1) AV1 (best compression, slow decode)")
+print("2) VP9 (recommended)")
+print("3) H.264 (max compatibility)")
+
+codec_choice = input("Choice [1-3]: ").strip()
+codec_map = {
+    '1': 'av1',
+    '2': 'vp9',
+    '3': 'avc1'
+}
+selected_codec = codec_map.get(codec_choice, 'vp9')
+
+print("Select resolution:")
+print("1) 1080p")
+print("2) 4K (2160p)")
+print("3) 8K (4320p)")
+res_choice = input("Choice [1-3]: ").strip()
+res_map = {
+    '1': 1080,
+    '2': 2160,
+    '3': 4320
+}
+selected_height = res_map.get(res_choice, None)
+
+print("HDR option:")
+print("1) HDR (if available)")
+print("2) SDR only")
+hdr_choice = input("Choice [1-2]: ").strip()
+
+hdr_filter = '[hdr=1]' if hdr_choice == '1' else ''
+height_filter = f"[height={selected_height}]" if selected_height else ''
+
+# ===================== yt-dlp Options =====================
+format_selector = (
+    f"bestvideo[vcodec*={selected_codec}]{hdr_filter}{height_filter}/"
+    f"bestvideo[vcodec*={selected_codec}]+bestaudio/best"
+)
+
+ydl_opts = {
+    'format': format_selector,
+    'outtmpl': os.path.join(out_dir, '%(title)s.%(ext)s'),
+    'merge_output_format': 'mkv',
     'progress_hooks': [progress_hook],
     'quiet': True,
     'noplaylist': True,
+
+    # Performance optimizations
+    'concurrent_fragment_downloads': 8,
+    'retries': 10,
+    'fragment_retries': 10,
+    'continuedl': True,
+
+    # External downloader (aria2)
+    'external_downloader': 'aria2c',
+    'external_downloader_args': ['-x16', '-k1M'],
 }
 
-with yt_dlp.YoutubeDL(ydl_opts_download) as ydl:
-    ydl.download([video_url])
+# ===================== Download =====================
+with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    ydl.download([url])
