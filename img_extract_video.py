@@ -1,85 +1,189 @@
-import cv2
+import subprocess
 import numpy as np
+import cv2
+import torch
 import os
-from concurrent.futures import ThreadPoolExecutor
-import cupy as cp
-import time
+from tqdm import tqdm
 
+# ---------------- DEVICE SELECTION ----------------
 
-def extract_frame_from_video(video_path, frame_idx, output_folder, gpu_enabled=False):
-    """
-    Extracts a single frame from a video at the given index.
+def choose_device():
+    print("\nChoose compute device:")
 
-    Args:
-    - video_path (str): Path to the input video file.
-    - frame_idx (int): Index of the frame to be extracted.
-    - output_folder (str): Folder to save the extracted frame.
-    - gpu_enabled (bool): Flag to indicate if GPU processing is enabled.
+    print("0 → CPU")
+    gpu_count = torch.cuda.device_count()
 
-    Returns:
-    - frame (numpy array): The extracted frame.
-    """
-    cap = cv2.VideoCapture(video_path)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)  # Set the frame position
-    ret, frame = cap.read()
+    for i in range(gpu_count):
+        print(f"{i+1} → GPU:{i} ({torch.cuda.get_device_name(i)})")
 
-    if not ret:
-        cap.release()
+    choice = input("Enter choice number: ").strip()
+
+    if choice == "0":
+        return torch.device("cpu")
+
+    try:
+        gpu_index = int(choice) - 1
+        if 0 <= gpu_index < gpu_count:
+            return torch.device(f"cuda:{gpu_index}")
+    except:
+        pass
+
+    print("[WARN] Invalid choice, falling back to CPU")
+    return torch.device("cpu")
+
+device = choose_device()
+print(f"[INFO] Using device: {device}")
+
+# ---------------- SCORING ----------------
+
+def score_frame(frame):
+    t = torch.from_numpy(frame).to(device).float()
+
+    gray = (
+        0.299 * t[..., 0] +
+        0.587 * t[..., 1] +
+        0.114 * t[..., 2]
+    )
+
+    lap = (
+        gray[:-2,1:-1] +
+        gray[2:,1:-1] +
+        gray[1:-1,:-2] +
+        gray[1:-1,2:] -
+        4 * gray[1:-1,1:-1]
+    ).abs()
+
+    sharpness = lap.var()
+    contrast = gray.std()
+    exposure_penalty = (gray.mean() - 128).abs()
+
+    score = (
+        0.6 * sharpness +
+        0.3 * contrast -
+        0.1 * exposure_penalty
+    )
+
+    return score.item()
+
+# ---------------- UTILITIES ----------------
+
+def get_video_resolution(video_path):
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=p=0",
+        video_path
+    ]
+    w, h = subprocess.check_output(cmd).decode().strip().split(",")
+    return int(w), int(h)
+
+def get_video_frame_count(video_path):
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-count_frames",
+        "-show_entries", "stream=nb_read_frames",
+        "-of", "csv=p=0",
+        video_path
+    ]
+    try:
+        return int(subprocess.check_output(cmd).decode().strip())
+    except:
         return None
 
-    # Convert the frame to a GPU array if GPU is enabled
-    if gpu_enabled:
-        frame_gpu = cp.asarray(frame)  # Convert to CuPy array (GPU)
-        frame = cp.asnumpy(frame_gpu)  # Convert back to NumPy array (CPU)
+# ---------------- MAIN PIPELINE ----------------
 
-    # Save the frame to disk
-    output_path = os.path.join(output_folder, f"frame_{frame_idx:04d}.jpg")
-    cv2.imwrite(output_path, frame)
-    cap.release()
+def main():
+    video_path = input("\nEnter full video path: ").strip('"')
+    out_dir = input("Enter output directory for images: ").strip('"')
 
-    return frame
+    if not os.path.exists(video_path):
+        print("[ERROR] Video not found")
+        return
 
+    os.makedirs(out_dir, exist_ok=True)
 
-def process_video(video_path, output_folder, gpu_enabled=False, max_workers=8):
-    """
-    Processes a video by extracting all frames in parallel.
+    print("\nChoose extraction mode:")
+    print("1 → Extract EVERY frame")
+    print("2 → Extract N frames per second")
 
-    Args:
-    - video_path (str): Path to the video file.
-    - output_folder (str): Directory to save the extracted frames.
-    - gpu_enabled (bool): Flag to indicate if GPU processing is enabled.
-    - max_workers (int): Maximum number of threads to use for parallelism.
-    """
-    # Create output folder if it doesn't exist
-    os.makedirs(output_folder, exist_ok=True)
+    mode = input("Enter choice (1 or 2): ").strip()
 
-    # Open the video to get total number of frames
-    cap = cv2.VideoCapture(video_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    cap.release()
+    fps_filter = ""
+    expected_frames = None
 
-    print(f"Total frames in video: {total_frames}")
+    if mode == "2":
+        fps = input("Enter frames per second (e.g. 1, 2, 5): ").strip()
+        if not fps.isdigit() or int(fps) <= 0:
+            print("[ERROR] Invalid FPS")
+            return
+        fps_filter = f"fps={fps},"
+        print(f"[INFO] Extracting {fps} FPS")
+    else:
+        expected_frames = get_video_frame_count(video_path)
+        print("[INFO] Extracting EVERY frame")
 
-    # Use ThreadPoolExecutor for parallel processing
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Extract frames in parallel
-        futures = []
-        for i in range(total_frames):
-            futures.append(executor.submit(extract_frame_from_video, video_path, i, output_folder, gpu_enabled))
+    width, height = get_video_resolution(video_path)
+    print(f"[INFO] Resolution: {width}x{height}")
 
-        # Wait for all futures to complete
-        for future in futures:
-            result = future.result()  # You can handle the result if needed
+    cmd = [
+        "ffmpeg",
+        "-threads", "0",
+        "-i", video_path,
+        "-vf", f"{fps_filter}format=rgb24",
+        "-f", "image2pipe",
+        "-vcodec", "rawvideo",
+        "-"
+    ]
 
-    print(f"All frames have been extracted to {output_folder}")
+    pipe = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10**8)
+    frame_size = width * height * 3
 
+    best_score = -1e9
+    best_path = None
+
+    progress = tqdm(total=expected_frames, unit="frame")
+
+    idx = 0
+    while True:
+        raw = pipe.stdout.read(frame_size)
+        if not raw:
+            break
+
+        frame = np.frombuffer(raw, np.uint8).reshape((height, width, 3))
+        filename = os.path.join(out_dir, f"frame_{idx:06d}.jpg")
+        cv2.imwrite(filename, frame)
+
+        # Downscale for scoring (performance)
+        small = cv2.resize(frame, (1280, int(1280 * height / width)))
+        score = score_frame(small)
+
+        if score > best_score:
+            best_score = score
+            best_path = filename
+
+        idx += 1
+        progress.update(1)
+
+    progress.close()
+    pipe.stdout.close()
+    pipe.wait()
+
+    print("\n================ RESULT ================")
+    print(f"Total frames extracted : {idx}")
+    print(f"Best image file        : {best_path}")
+    print(f"Best image score       : {best_score:.2f}")
+    print("=======================================\n")
+
+    best_img = cv2.imread(best_path)
+    cv2.imshow("BEST IMAGE", best_img)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+    os.startfile(best_path)
+
+# ---------------- ENTRY ----------------
 
 if __name__ == "__main__":
-    video_path = 'input_video.mp4'  # Path to your input video
-    output_folder = 'extracted_frames'  # Output folder where frames will be saved
-    gpu_enabled = True  # Set to True if you want to use GPU for processing
-    max_workers = 8  # Number of threads for parallel processing
-
-    start_time = time.time()
-    process_video(video_path, output_folder, gpu_enabled, max_workers)
-    print(f"Time taken: {time.time() - start_time:.2f} seconds")
+    main()
