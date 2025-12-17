@@ -103,7 +103,7 @@ def main():
     SCORE_W = 1280
     SCORE_H = int(H * SCORE_W / W)
 
-    batch_size = 8 if device.type == "cuda" else 1
+    batch_size = 32 if device.type == "cuda" else 1
 
     vf = []
     if fps_extract:
@@ -142,7 +142,9 @@ def main():
 
         frame = np.frombuffer(raw, np.uint8).reshape((H, W, 3))
         fname = os.path.join(out_dir, f"frame_{idx:06d}{ext}")
-        cv2.imwrite(fname, frame)
+        from concurrent.futures import ThreadPoolExecutor
+        executor = ThreadPoolExecutor(max_workers=4)
+        executor.submit(cv2.imwrite, path, frame)
 
         # Downscale only for scoring
         small = cv2.resize(frame, (SCORE_W, SCORE_H), interpolation=cv2.INTER_AREA)
