@@ -5,19 +5,46 @@ import cv2
 import os
 from tqdm import tqdm
 
-# ================= CONFIG =================
+# ================= USER OPTIONS =================
 
-BATCH_SIZE = 8                 # Increase to 16 if VRAM allows
-DOWNSCALE_WIDTH = 1280         # For scoring only
+def choose_device():
+    print("\nChoose compute device:")
+    print("0 → CPU")
 
-# =========================================
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            print(f"{i+1} → GPU:{i} ({torch.cuda.get_device_name(i)})")
 
-device = torch.device("cuda:0")
-torch.backends.cudnn.benchmark = True
+    choice = input("Enter choice: ").strip()
 
-# ---------------- SCORING (BATCHED) ----------------
+    if choice == "0" or not torch.cuda.is_available():
+        return torch.device("cpu")
 
-def score_batch(frames_np):
+    try:
+        idx = int(choice) - 1
+        return torch.device(f"cuda:{idx}")
+    except:
+        print("[WARN] Invalid choice, using CPU")
+        return torch.device("cpu")
+
+def choose_extraction_mode():
+    print("\nChoose extraction mode:")
+    print("1 → Extract EVERY frame")
+    print("2 → Extract N frames per second")
+
+    mode = input("Enter choice (1 or 2): ").strip()
+    if mode == "1":
+        return "all", None
+
+    fps = input("Enter frames per second (e.g. 1, 2, 5): ").strip()
+    if not fps.isdigit() or int(fps) <= 0:
+        raise ValueError("Invalid FPS value")
+
+    return "fps", int(fps)
+
+# ================= GPU SCORING =================
+
+def score_batch(frames_np, device):
     t = torch.from_numpy(np.stack(frames_np)).to(device).float()
     t = t.permute(0, 3, 1, 2)  # B C H W
 
@@ -28,16 +55,14 @@ def score_batch(frames_np):
     )
 
     # Gradients
-    gx = gray[:, :, 1:] - gray[:, :, :-1]   # B H W-1
-    gy = gray[:, 1:, :] - gray[:, :-1, :]   # B H-1 W
+    gx = gray[:, :, 1:] - gray[:, :, :-1]
+    gy = gray[:, 1:, :] - gray[:, :-1, :]
 
-    # Align shapes
-    gx_c = gx[:, :-1, :]    # B H-1 W-1
-    gy_c = gy[:, :, :-1]   # B H-1 W-1
+    gx_c = gx[:, :-1, :]
+    gy_c = gy[:, :, :-1]
 
     grad_mag = torch.sqrt(gx_c**2 + gy_c**2)
 
-    # Laplacian (sharpness)
     lap = (
         gray[:, :-2, 1:-1] +
         gray[:, 2:, 1:-1] +
@@ -60,7 +85,7 @@ def score_batch(frames_np):
 
     return score.detach().cpu().tolist()
 
-# ---------------- UTILITIES ----------------
+# ================= VIDEO UTILS =================
 
 def get_video_info(video):
     cmd = [
@@ -70,59 +95,69 @@ def get_video_info(video):
         "-of", "csv=p=0",
         video
     ]
-    out = subprocess.check_output(cmd).decode().strip().split(",")
-    w, h = int(out[0]), int(out[1])
-    total = int(out[2]) if len(out) > 2 and out[2].isdigit() else None
-    return w, h, total
+    w, h, n = subprocess.check_output(cmd).decode().strip().split(",")
+    return int(w), int(h), int(n) if n.isdigit() else None
 
-# ---------------- MAIN ----------------
+# ================= MAIN =================
 
 def main():
-    video = input("Enter H264 video path: ").strip('"')
+    device = choose_device()
+    print(f"[INFO] Using device: {device}")
+
+    video = input("\nEnter video path: ").strip('"')
     out_dir = input("Enter output directory: ").strip('"')
-    fps = input("Frames per second (e.g. 1): ").strip()
 
     os.makedirs(out_dir, exist_ok=True)
 
+    mode, fps = choose_extraction_mode()
+
     width, height, total = get_video_info(video)
-    print(f"[INFO] {width}x{height}, total frames: {total}")
+    print(f"[INFO] Resolution: {width}x{height}")
+
+    SCALE_W = 1280
+    SCALE_H = int(height * SCALE_W / width)
+    BATCH_SIZE = 8 if device.type == "cuda" else 1
+
+    if mode == "fps":
+        vf = f"fps={fps},scale={SCALE_W}:-1,format=rgb24"
+    else:
+        vf = f"scale={SCALE_W}:-1,format=rgb24"
 
     cmd = [
         "ffmpeg",
-        "-c:v", "h264_cuvid",  # ✅ GPU decode (NVDEC)
+        "-c:v", "h264_cuvid",   # GPU decode (safe on Windows)
         "-i", video,
-        "-vf", f"fps={fps},scale={DOWNSCALE_WIDTH}:-1:flags=fast_bilinear,format=rgb24",
+        "-vf", vf,
         "-f", "rawvideo",
         "-"
     ]
 
     pipe = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10**8)
-    frame_size = DOWNSCALE_WIDTH * int(height * DOWNSCALE_WIDTH / width) * 3
-
-    batch_frames = []
-    batch_paths = []
+    frame_size = SCALE_W * SCALE_H * 3
 
     best_score = -1e9
     best_path = None
 
-    idx = 0
+    batch_frames = []
+    batch_paths = []
+
     pbar = tqdm(unit="frame")
+    idx = 0
 
     while True:
         raw = pipe.stdout.read(frame_size)
         if not raw:
             break
 
-        scaled_h = int(height * DOWNSCALE_WIDTH / width)
-        frame = np.frombuffer(raw, np.uint8).reshape((scaled_h, DOWNSCALE_WIDTH, 3))
-        filename = os.path.join(out_dir, f"frame_{idx:06d}.jpg")
+        frame = np.frombuffer(raw, np.uint8).reshape((SCALE_H, SCALE_W, 3))
+        path = os.path.join(out_dir, f"frame_{idx:06d}.jpg")
+        cv2.imwrite(path, frame)
 
-        cv2.imwrite(filename, frame)
         batch_frames.append(frame)
-        batch_paths.append(filename)
+        batch_paths.append(path)
 
         if len(batch_frames) == BATCH_SIZE:
-            scores = score_batch(batch_frames)
+            scores = score_batch(batch_frames, device)
             for s, p in zip(scores, batch_paths):
                 if s > best_score:
                     best_score = s
@@ -134,7 +169,7 @@ def main():
         pbar.update(1)
 
     if batch_frames:
-        scores = score_batch(batch_frames)
+        scores = score_batch(batch_frames, device)
         for s, p in zip(scores, batch_paths):
             if s > best_score:
                 best_score = s
@@ -149,7 +184,7 @@ def main():
     print(f"Best image score       : {best_score:.2f}")
     print("=======================================\n")
 
-# ---------------- ENTRY ----------------
+# ================= ENTRY =================
 
 if __name__ == "__main__":
     main()
