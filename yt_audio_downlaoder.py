@@ -1,206 +1,387 @@
 #!/usr/bin/env python3
 """
 yt_audio_downloader.py
-A robust YouTube audio downloader built on yt-dlp.
+Interactive YouTube audio downloader with a premium terminal UI.
 """
 
-import argparse
+import itertools
 import re
 import shutil
 import sys
+import threading
+import time
 from pathlib import Path
 
 from yt_dlp import YoutubeDL
 
 
-# ─────────────────────────── ANSI colours ────────────────────────────────────
-# Automatically disabled when stdout is not a TTY (e.g. piped to a file).
+# ══════════════════════════════════════════════════════════════════════════════
+#  COLOUR SYSTEM
+#  Auto-disabled when not a TTY (piped / redirected output)
+# ══════════════════════════════════════════════════════════════════════════════
 
 _TTY = sys.stdout.isatty()
 
-def _c(code: str, text: str) -> str:
-    return f"\033[{code}m{text}\033[0m" if _TTY else text
+def _c(code: str, t: str) -> str:
+    return f"\033[{code}m{t}\033[0m" if _TTY else t
 
-def green(t):  return _c("32", t)
-def yellow(t): return _c("33", t)
-def cyan(t):   return _c("36", t)
-def bold(t):   return _c("1",  t)
-def dim(t):    return _c("2",  t)
-def red(t):    return _c("31", t)
+# Palette
+def orange(t):     return _c("38;5;214", t)   # brand accent — warm amber
+def gold(t):       return _c("38;5;220", t)   # secondary highlight
+def smoke(t):      return _c("38;5;245", t)   # muted secondary text
+def ghost(t):      return _c("38;5;238", t)   # very dim / decorative
+def green(t):      return _c("38;5;120", t)   # success
+def red(t):        return _c("38;5;203", t)   # error
+def yellow(t):     return _c("38;5;228", t)   # warning
+def white(t):      return _c("97", t)          # primary text
+def bold(t):       return _c("1",  t)
+def dim(t):        return _c("2",  t)
+def italic(t):     return _c("3",  t)
 
 
-# ─────────────────────────── Known noisy warnings ────────────────────────────
-# These are YouTube-side limitations — not actionable by the user.
-# Silenced to keep output clean.
+# ══════════════════════════════════════════════════════════════════════════════
+#  NOISE FILTERS
+# ══════════════════════════════════════════════════════════════════════════════
 
-_MUTED_PATTERNS = [
-    r"android client https formats require a GVS PO Token",
-    r"Some web client https formats have been skipped.*SABR",
-    r"Falling back to.*player",
-    r"po_token",
-    # JS-challenge solver warnings — shown separately with a helpful hint
-    r"Remote components challenge solver script.*were skipped",
-    r"Signature solving failed",
-    r"n challenge solving failed",
-]
-_MUTED_RE = re.compile("|".join(_MUTED_PATTERNS), re.IGNORECASE)
-
-# Patterns that indicate yt-dlp can't solve JS challenges (no Node/Deno)
-_JS_CHALLENGE_RE = re.compile(
-    r"(Signature solving failed|n challenge solving failed|Remote components challenge solver)",
+_MUTED = re.compile(
+    r"(GVS PO Token|SABR streaming|Falling back|po_token"
+    r"|Remote components challenge solver|Signature solving failed"
+    r"|n challenge solving failed|Skipping unsupported client)",
     re.IGNORECASE,
 )
-_js_challenge_warned = False   # show the hint only once per run
+_JS_RE = re.compile(
+    r"(Signature solving failed|n challenge solving failed"
+    r"|Remote components challenge solver)",
+    re.IGNORECASE,
+)
+_js_warned = False
 
 
-# ─────────────────────────── Dependency check ────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  LOGGER
+# ══════════════════════════════════════════════════════════════════════════════
 
-def check_dependencies() -> None:
-    if shutil.which("ffmpeg") is None:
-        print(
-            red("  ✗ ffmpeg not found in PATH.\n") +
-            "  Install it first:\n"
-            f"    macOS   →  brew install ffmpeg\n"
-            f"    Ubuntu  →  sudo apt install ffmpeg\n"
-            f"    Windows →  https://ffmpeg.org/download.html",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-
-# ─────────────────────────── Custom logger ───────────────────────────────────
-
-class QuietLogger:
-    """Pass warnings/errors to stderr; suppress everything else."""
-
-    def debug(self, msg: str) -> None:
-        pass
-
-    def info(self, msg: str) -> None:
-        pass
+class SilentLogger:
+    def debug(self, _):   pass
+    def info(self, _):    pass
 
     def warning(self, msg: str) -> None:
-        global _js_challenge_warned
+        global _js_warned
         clean = re.sub(r"^\[.*?\]\s[\w-]+:\s", "", msg).strip()
-
-        # JS-challenge failures: collapse three raw lines into one helpful hint
-        if _JS_CHALLENGE_RE.search(clean):
-            if not _js_challenge_warned:
-                _js_challenge_warned = True
-                print(
-                    f"\n  {yellow('⚠')}  JS challenge solving unavailable "
-                    f"{dim('(Node.js / Deno not found)')}\n"
-                    f"     Some formats may be missing — download may still succeed.\n"
-                    f"     Install Node.js to fully resolve: {dim('https://nodejs.org')}",
-                    file=sys.stderr,
+        if _JS_RE.search(clean):
+            if not _js_warned:
+                _js_warned = True
+                _print_warning(
+                    "JS challenge solver missing  "
+                    + smoke("install Node.js → https://nodejs.org")
                 )
             return
-
-        if _MUTED_RE.search(clean):
+        if _MUTED.search(clean):
             return
-        print(f"\n  {yellow('⚠')}  {dim(clean)}", file=sys.stderr)
+        _print_warning(clean)
 
     def error(self, msg: str) -> None:
         clean = re.sub(r"^\[.*?\]\s[\w-]+:\s", "", msg).strip()
-        print(f"\n  {red('✗')}  {clean}", file=sys.stderr)
+        # suppress "already recorded" archive messages — handled visually
+        if "has already been recorded" in clean:
+            return
+        _print_error(clean)
 
 
-# ─────────────────────────── Progress hook ───────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  SPINNER
+# ══════════════════════════════════════════════════════════════════════════════
 
-BAR_WIDTH = 26
+_SPINNER_FRAMES = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
 
-def _bar(percent: float) -> str:
-    filled = int(BAR_WIDTH * percent / 100)
-    return "[" + green("█" * filled) + dim("░" * (BAR_WIDTH - filled)) + "]"
+class Spinner:
+    def __init__(self, label: str):
+        self.label   = label
+        self._stop   = threading.Event()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
 
-def progress_hook(d: dict) -> None:
-    status = d["status"]
+    def _spin(self):
+        for f in itertools.cycle(_SPINNER_FRAMES):
+            if self._stop.is_set():
+                break
+            sys.stdout.write(f"\r  {orange(f)}  {smoke(self.label)}   ")
+            sys.stdout.flush()
+            time.sleep(0.08)
 
-    if status == "downloading":
-        total      = d.get("total_bytes") or d.get("total_bytes_estimate")
-        downloaded = d.get("downloaded_bytes", 0)
-        speed      = d.get("speed")
-        eta        = d.get("eta")
+    def __enter__(self):
+        self._thread.start()
+        return self
 
-        speed_str = f"{speed / 1024 / 1024:.1f} MB/s" if speed else "--.- MB/s"
-        eta_str   = f"ETA {eta}s" if eta is not None else "ETA ?s"
-
-        if total:
-            percent = downloaded * 100 / total
-            print(
-                f"\r  {_bar(percent)} {green(f'{percent:5.1f}%')}  "
-                f"{cyan(speed_str)}  {dim(eta_str)}   ",
-                end="", flush=True,
-            )
-        else:
-            mb = downloaded / 1024 / 1024
-            print(
-                f"\r  {cyan(f'{mb:.2f} MB')} downloaded  {cyan(speed_str)}   ",
-                end="", flush=True,
-            )
-
-    elif status == "finished":
-        full_bar = "[" + green("█" * BAR_WIDTH) + "]"
-        print(
-            f"\r  {full_bar} {green('100.0%')}  {dim('Processing…')}   ",
-            flush=True,
-        )
-
-    elif status == "error":
-        print(f"\n  {red('✗')}  Fragment error — yt-dlp will retry.", file=sys.stderr)
+    def __exit__(self, *_):
+        self._stop.set()
+        self._thread.join()
+        sys.stdout.write("\r" + " " * 60 + "\r")
+        sys.stdout.flush()
 
 
-# ─────────────────────────── Duplicate handling ──────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  PRINT HELPERS  (all output goes through here for consistent indentation)
+# ══════════════════════════════════════════════════════════════════════════════
 
-def get_archive_path() -> Path:
-    """Persistent per-user archive so already-downloaded tracks are skipped."""
-    cache = Path.home() / ".cache" / "yt-audio-dl"
-    cache.mkdir(parents=True, exist_ok=True)
-    return cache / "downloaded.txt"
+def _ln(text: str = ""):
+    print(text)
 
+def _print_rule(char: str = "─", width: int = 56):
+    print("  " + ghost(char * width))
 
-# ─────────────────────────── Output template ─────────────────────────────────
+def _print_warning(msg: str):
+    print(f"\n  {yellow('◆')}  {smoke(msg)}")
 
-def build_output_template(custom, is_playlist: bool) -> str:
-    if custom:
-        return custom
-    music_dir = Path.home() / "Music"
-    music_dir.mkdir(parents=True, exist_ok=True)
-    if is_playlist:
-        return str(music_dir / "%(playlist_title)s" / "%(playlist_index)s - %(title)s.%(ext)s")
-    return str(music_dir / "%(title)s.%(ext)s")
+def _print_error(msg: str):
+    print(f"\n  {red('✗')}  {msg}")
 
 
-def is_playlist_url(url: str) -> bool:
-    return "list=" in url
+# ══════════════════════════════════════════════════════════════════════════════
+#  SPLASH SCREEN
+# ══════════════════════════════════════════════════════════════════════════════
+
+_LOGO = r"""
+    ╦ ╦╔╦╗       ╔═╗╦ ╦╔╦╗╦╔═╗
+    ╚╦╝ ║─────── ╠═╣║ ║ ║║║║ ║
+     ╩  ╩        ╩ ╩╚═╝═╩╝╩╚═╝
+"""
+
+def print_splash():
+    _ln()
+    for line in _LOGO.strip("\n").splitlines():
+        print("  " + orange(line))
+    _ln()
+    print(f"  {smoke('pull audio from youtube  ·  fast · clean · tagged')}")
+    _ln()
+    _print_rule()
+    _ln()
 
 
-# ─────────────────────────── CLI ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  SETTINGS  (interactive inline config)
+# ══════════════════════════════════════════════════════════════════════════════
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Download audio from YouTube videos or playlists.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+CODECS   = ["m4a", "mp3", "opus", "flac"]
+DEFAULTS = {
+    "codec":     "m4a",
+    "quality":   "192",
+    "thumbnail": True,
+    "archive":   True,
+}
+
+def _codec_display(cfg: dict) -> str:
+    parts = []
+    for c in CODECS:
+        parts.append(bold(orange(c)) if c == cfg["codec"] else smoke(c))
+    return "  ·  ".join(parts)
+
+def _bool_display(val: bool) -> str:
+    return green("on") if val else smoke("off")
+
+def print_settings(cfg: dict):
+    music_dir = str(Path.home() / "Music")
+    _ln()
+    print(f"  {ghost('◆')}  {white('settings')}")
+    _ln()
+    print(f"  {'codec':<14}{_codec_display(cfg)}")
+    print(f"  {'quality':<14}{smoke(cfg['quality'] + ' kbps')}")
+    print(f"  {'save to':<14}{smoke(music_dir)}")
+    print(f"  {'thumbnail':<14}{_bool_display(cfg['thumbnail'])}")
+    print(f"  {'skip dupes':<14}{_bool_display(cfg['archive'])}")
+    _ln()
+    _print_rule()
+    _ln()
+
+def ask_settings(cfg: dict) -> dict:
+    """Prompt the user to optionally tweak settings, or just hit enter."""
+    cfg = dict(cfg)  # shallow copy
+
+    print_settings(cfg)
+    print(
+        f"  {smoke('change a setting or press')} {white('enter')} "
+        f"{smoke('to start downloading')}"
     )
-    parser.add_argument("url", help="YouTube video or playlist URL")
-    parser.add_argument("-o", "--output", default=None,
-        help="Custom yt-dlp output template (overrides ~/Music)")
-    parser.add_argument("-c", "--codec", default="m4a",
-        choices=["m4a", "mp3", "opus", "flac"], help="Audio codec")
-    parser.add_argument("-q", "--quality", default="192",
-        help="Bitrate in kbps for lossy codecs. Use '0' for VBR best (mp3).")
-    parser.add_argument("-p", "--parallel", type=int, default=1,
-        help="Parallel fragment downloads (DASH/HLS only)")
-    parser.add_argument("--no-thumbnail", action="store_true",
-        help="Skip thumbnail embedding")
-    parser.add_argument("--no-archive", action="store_true",
-        help="Disable duplicate detection — re-download already saved tracks")
-    return parser.parse_args()
+    print(
+        f"  {ghost('codec / quality / thumbnail / dupes / all defaults')}"
+    )
+    _ln()
+
+    while True:
+        try:
+            raw = input(f"  {orange('◆')}  {white('setting')} {smoke('›')} ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            raise KeyboardInterrupt
+
+        if not raw:
+            break
+
+        if raw in ("codec", "c"):
+            opts = " · ".join(CODECS)
+            raw2 = input(f"  {smoke('codec')} {ghost('[' + opts + ']')} {smoke('›')} ").strip().lower()
+            if raw2 in CODECS:
+                cfg["codec"] = raw2
+        elif raw in ("quality", "q"):
+            raw2 = input(f"  {smoke('quality kbps')} {ghost('[e.g. 128 / 192 / 320]')} {smoke('›')} ").strip()
+            if raw2.isdigit():
+                cfg["quality"] = raw2
+        elif raw in ("thumbnail", "t"):
+            raw2 = input(f"  {smoke('thumbnail on/off')} {smoke('›')} ").strip().lower()
+            if raw2 in ("on", "yes", "y", "1"):  cfg["thumbnail"] = True
+            elif raw2 in ("off", "no", "n", "0"): cfg["thumbnail"] = False
+        elif raw in ("dupes", "d", "archive", "a"):
+            raw2 = input(f"  {smoke('skip duplicates on/off')} {smoke('›')} ").strip().lower()
+            if raw2 in ("on", "yes", "y", "1"):  cfg["archive"] = True
+            elif raw2 in ("off", "no", "n", "0"): cfg["archive"] = False
+        elif raw in ("defaults", "reset"):
+            cfg = dict(DEFAULTS)
+        else:
+            print(f"  {ghost('unknown setting — try: codec / quality / thumbnail / dupes')}")
+            continue
+
+        # Refresh display after change
+        print()
+        print_settings(cfg)
+        print(f"  {smoke('change another or press')} {white('enter')} {smoke('to start')}")
+        _ln()
+
+    _ln()
+    return cfg
 
 
-# ─────────────────────────── Postprocessors ──────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  URL COLLECTION
+# ══════════════════════════════════════════════════════════════════════════════
 
-def build_postprocessors(codec: str, quality: str, embed_thumbnail: bool) -> list:
+def collect_urls() -> list[str]:
+    print(f"  {ghost('◆')}  {white('queue')}")
+    _ln()
+    print(f"  {smoke('paste one url per line')}")
+    print(f"  {smoke('leave blank and press')} {white('enter')} {smoke('to continue')}")
+    _ln()
+
+    urls = []
+    idx  = 1
+    while True:
+        try:
+            raw = input(f"  {orange('◆')}  {white(str(idx))} {smoke('›')} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            raise KeyboardInterrupt
+
+        if not raw:
+            if not urls:
+                print(f"  {ghost('add at least one url first')}")
+                continue
+            break
+
+        # Basic URL sanity check
+        if not raw.startswith(("http://", "https://")):
+            print(f"  {red('✗')}  {smoke('does not look like a url — try again')}")
+            continue
+
+        urls.append(raw)
+        idx += 1
+
+    _ln()
+    _print_rule()
+    return urls
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  QUEUE DISPLAY
+# ══════════════════════════════════════════════════════════════════════════════
+
+_STATE_ICON = {
+    "pending":    smoke("○"),
+    "active":     orange("◆"),
+    "done":       green("✓"),
+    "skipped":    smoke("◇"),
+    "error":      red("✗"),
+}
+
+def print_queue(urls: list[str], states: dict, current: int):
+    _ln()
+    for i, url in enumerate(urls):
+        state  = states.get(i, "pending")
+        icon   = _STATE_ICON[state]
+        # Truncate long URLs for display
+        label  = url if len(url) <= 52 else url[:49] + "…"
+        suffix = smoke(" · already in library") if state == "skipped" else ""
+        label_col = smoke(label) if state == "pending" else (
+            white(label) if state == "active" else dim(label)
+        )
+        print(f"  {icon}  {label_col}{suffix}")
+    _ln()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PROGRESS HOOK
+# ══════════════════════════════════════════════════════════════════════════════
+
+BAR_W = 28
+
+def _bar(pct: float) -> str:
+    n = int(BAR_W * pct / 100)
+    return (
+        ghost("▕")
+        + orange("█" * n)
+        + ghost("░" * (BAR_W - n))
+        + ghost("▏")
+    )
+
+# Shared state between hook and main
+_current_title  = ""
+_download_done  = False
+
+def make_progress_hook():
+    _done = [False]
+
+    def hook(d: dict):
+        status = d["status"]
+
+        if status == "downloading":
+            total      = d.get("total_bytes") or d.get("total_bytes_estimate")
+            downloaded = d.get("downloaded_bytes", 0)
+            speed      = d.get("speed")
+            eta        = d.get("eta")
+
+            spd = f"{speed/1024/1024:.1f} MB/s" if speed else "··· MB/s"
+            eta_s = f"{eta}s" if eta is not None else "?s"
+
+            if total:
+                pct = downloaded * 100 / total
+                print(
+                    f"\r  {_bar(pct)} {orange(f'{pct:5.1f}%')}"
+                    f"  {smoke(spd)}  {ghost('eta ' + eta_s)}   ",
+                    end="", flush=True,
+                )
+            else:
+                mb = downloaded / 1024 / 1024
+                print(
+                    f"\r  {ghost('▕' + '░' * BAR_W + '▏')}  "
+                    f"{smoke(f'{mb:.1f} MB')}  {smoke(spd)}   ",
+                    end="", flush=True,
+                )
+
+        elif status == "finished":
+            # Snap bar to 100% then hand off to spinner for ffmpeg
+            print(
+                f"\r  {ghost('▕')}{orange('█' * BAR_W)}{ghost('▏')}"
+                f" {orange('100.0%')}   ",
+                flush=True,
+            )
+            _done[0] = True
+
+        elif status == "error":
+            print(f"\n  {red('✗')}  fragment error — retrying", flush=True)
+
+    return hook, _done
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  POSTPROCESSORS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_postprocessors(codec: str, quality: str, embed_thumb: bool) -> list:
     pp = [
         {"key": "FFmpegMetadata", "add_metadata": True},
         {
@@ -209,7 +390,7 @@ def build_postprocessors(codec: str, quality: str, embed_thumbnail: bool) -> lis
             "preferredquality": quality if codec != "flac" else "0",
         },
     ]
-    if embed_thumbnail:
+    if embed_thumb:
         pp += [
             {"key": "FFmpegThumbnailsConvertor", "format": "jpg"},
             {"key": "EmbedThumbnail"},
@@ -217,85 +398,191 @@ def build_postprocessors(codec: str, quality: str, embed_thumbnail: bool) -> lis
     return pp
 
 
-# ─────────────────────────── Header ──────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  ARCHIVE
+# ══════════════════════════════════════════════════════════════════════════════
 
-def print_header(args, outtmpl: str, embed_thumb: bool, archive_path) -> None:
-    W = 52
-    br  = bold(cyan("│"))
-    print(bold(cyan("┌" + "─" * W + "┐")))
-    title = bold("  🎵  yt-audio-dl")
-    print(f"{br}{title:^{W}}{br}")
-    print(bold(cyan("├" + "─" * W + "┤")))
+def get_archive_path() -> Path:
+    p = Path.home() / ".cache" / "yt-audio-dl"
+    p.mkdir(parents=True, exist_ok=True)
+    return p / "downloaded.txt"
 
-    out_folder = str(Path(outtmpl).parent)
-    rows = [
-        ("Codec",      f"{bold(args.codec.upper())}  {dim(args.quality + ' kbps')}"),
-        ("Thumbnail",  green("embedded") if embed_thumb else dim("skipped")),
-        ("Duplicates", dim("skipped via archive") if archive_path else yellow("allowed")),
-        ("Save to",    dim(out_folder)),
-    ]
-    for label, value in rows:
-        content = f"  {cyan(label):<22}{value}"
-        print(f"{br}{content}")
-
-    print(bold(cyan("└" + "─" * W + "┘")))
-    print()
+def is_playlist_url(url: str) -> bool:
+    return "list=" in url
 
 
-# ─────────────────────────── Main ────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  PER-TRACK DOWNLOAD
+# ══════════════════════════════════════════════════════════════════════════════
 
-def main() -> None:
-    check_dependencies()
-    args = parse_args()
-
-    playlist     = is_playlist_url(args.url)
-    outtmpl      = build_output_template(args.output, playlist)
-    embed_thumb  = not args.no_thumbnail
-    archive_path = None if args.no_archive else get_archive_path()
-    postprocessors = build_postprocessors(args.codec, args.quality, embed_thumb)
-
-    print_header(args, outtmpl, embed_thumb, archive_path)
+def download_one(url: str, cfg: dict, archive_path) -> str:
+    """
+    Download a single URL.
+    Returns: "done" | "skipped" | "error"
+    """
+    playlist    = is_playlist_url(url)
+    music_dir   = Path.home() / "Music"
+    music_dir.mkdir(parents=True, exist_ok=True)
 
     if playlist:
-        print(f"  {cyan('ℹ')}  Playlist detected — grouping tracks into a subfolder.\n")
+        outtmpl = str(music_dir / "%(playlist_title)s" / "%(playlist_index)s - %(title)s.%(ext)s")
+    else:
+        outtmpl = str(music_dir / "%(title)s.%(ext)s")
+
+    progress_hook, _done = make_progress_hook()
 
     ydl_opts = {
         "format":            "bestaudio/best",
         "outtmpl":           outtmpl,
-        "logger":            QuietLogger(),
+        "logger":            SilentLogger(),
         "restrictfilenames": True,
-
-        # Duplicate handling
+        "writethumbnail":    cfg["thumbnail"],
         **({"download_archive": str(archive_path)} if archive_path else {}),
-
-        # Thumbnail — EmbedThumbnail postprocessor handles embedding
-        # Do NOT also set "embedthumbnail": True or it double-embeds
-        "writethumbnail": embed_thumb,
-
-        # tv_embedded and android don't require JS challenge solving or PO tokens,
-        # making them safe fallbacks when Node.js / Deno is not installed.
         "extractor_args": {
             "youtube": {"player_client": ["tv_embedded", "android"]},
         },
-
-        "retries":          10,
-        "fragment_retries": 10,
-        "concurrent_fragment_downloads": args.parallel,
-        "postprocessors":   postprocessors,
-        "progress_hooks":   [progress_hook],
+        "retries":           10,
+        "fragment_retries":  10,
+        "concurrent_fragment_downloads": 1,
+        "postprocessors":    build_postprocessors(
+            cfg["codec"], cfg["quality"], cfg["thumbnail"]
+        ),
+        "progress_hooks":    [progress_hook],
     }
 
+    # Fetch title first for the track header
+    title = _resolve_title(url)
+    if title:
+        print(f"  {smoke('track')}  {white(title)}")
+    _ln()
+
+    result = "done"
     try:
         with YoutubeDL(ydl_opts) as ydl:
-            ydl.download([args.url])
-    except KeyboardInterrupt:
-        print(f"\n\n  {yellow('⚠')}  Cancelled by user.", file=sys.stderr)
-        sys.exit(130)
-    except Exception as exc:
-        print(f"\n  {red('✗')}  Download failed: {exc}", file=sys.stderr)
+            ret = ydl.download([url])
+            # yt-dlp returns 0 on success, 101 when archive-skipped
+            if ret == 101:
+                result = "skipped"
+    except SystemExit as e:
+        if e.code == 101:
+            result = "skipped"
+        else:
+            result = "error"
+    except Exception:
+        result = "error"
+
+    if result == "done":
+        # Brief spinner for ffmpeg encode phase (already started by yt-dlp)
+        with Spinner("encoding  ·  embedding tags + artwork"):
+            time.sleep(0.4)   # ffmpeg finishes async; give it a moment
+        _ln()
+        print(f"  {green('✓')}  {smoke('saved to')} {white(str(music_dir))}")
+    elif result == "skipped":
+        print(f"  {smoke('◇')}  {smoke('already in library  ·  skipped')}")
+    else:
+        _print_error("download failed  ·  see warnings above")
+
+    return result
+
+
+def _resolve_title(url: str) -> str:
+    """Quietly extract the video title without downloading."""
+    try:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "logger": SilentLogger(),
+            "extractor_args": {
+                "youtube": {"player_client": ["tv_embedded", "android"]},
+            },
+        }
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return info.get("title", "") if info else ""
+    except Exception:
+        return ""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SESSION SUMMARY
+# ══════════════════════════════════════════════════════════════════════════════
+
+def print_summary(states: dict, total: int):
+    done    = sum(1 for s in states.values() if s == "done")
+    skipped = sum(1 for s in states.values() if s == "skipped")
+    errors  = sum(1 for s in states.values() if s == "error")
+
+    _print_rule()
+    _ln()
+    print(f"  {ghost('◆')}  {white('session complete')}")
+    _ln()
+
+    if done:
+        print(f"  {green('✓')}  {bold(str(done))} {smoke('downloaded')}")
+    if skipped:
+        print(f"  {smoke('◇')}  {bold(str(skipped))} {smoke('already in library')}")
+    if errors:
+        print(f"  {red('✗')}  {bold(str(errors))} {smoke('failed')}")
+
+    _ln()
+    print(f"  {smoke('library')}  {white(str(Path.home() / 'Music'))}")
+    _ln()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DEPENDENCY CHECK
+# ══════════════════════════════════════════════════════════════════════════════
+
+def check_deps():
+    if shutil.which("ffmpeg") is None:
+        print(
+            f"\n  {red('✗')}  ffmpeg not found\n\n"
+            f"  {smoke('install it first:')}\n"
+            f"  {ghost('macOS')}   brew install ffmpeg\n"
+            f"  {ghost('Ubuntu')}  sudo apt install ffmpeg\n"
+            f"  {ghost('Win')}     https://ffmpeg.org/download.html\n",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-    print(f"\n  {green('✓')}  {bold('All done!')}\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    check_deps()
+
+    try:
+        print_splash()
+        urls = collect_urls()
+        cfg  = ask_settings(DEFAULTS)
+    except KeyboardInterrupt:
+        print(f"\n\n  {smoke('bye.')}\n")
+        sys.exit(0)
+
+    archive_path = get_archive_path() if cfg["archive"] else None
+    states: dict[int, str] = {}
+
+    for i, url in enumerate(urls):
+        states[i] = "active"
+        print_queue(urls, states, i)
+        _print_rule()
+        _ln()
+
+        try:
+            result = download_one(url, cfg, archive_path)
+        except KeyboardInterrupt:
+            print(f"\n\n  {smoke('cancelled.')}\n")
+            sys.exit(0)
+
+        states[i] = result
+        _ln()
+        _print_rule()
+        _ln()
+
+    print_summary(states, len(urls))
 
 
 if __name__ == "__main__":
