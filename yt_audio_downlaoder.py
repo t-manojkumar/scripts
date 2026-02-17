@@ -38,8 +38,19 @@ _MUTED_PATTERNS = [
     r"Some web client https formats have been skipped.*SABR",
     r"Falling back to.*player",
     r"po_token",
+    # JS-challenge solver warnings — shown separately with a helpful hint
+    r"Remote components challenge solver script.*were skipped",
+    r"Signature solving failed",
+    r"n challenge solving failed",
 ]
 _MUTED_RE = re.compile("|".join(_MUTED_PATTERNS), re.IGNORECASE)
+
+# Patterns that indicate yt-dlp can't solve JS challenges (no Node/Deno)
+_JS_CHALLENGE_RE = re.compile(
+    r"(Signature solving failed|n challenge solving failed|Remote components challenge solver)",
+    re.IGNORECASE,
+)
+_js_challenge_warned = False   # show the hint only once per run
 
 
 # ─────────────────────────── Dependency check ────────────────────────────────
@@ -69,7 +80,22 @@ class QuietLogger:
         pass
 
     def warning(self, msg: str) -> None:
+        global _js_challenge_warned
         clean = re.sub(r"^\[.*?\]\s[\w-]+:\s", "", msg).strip()
+
+        # JS-challenge failures: collapse three raw lines into one helpful hint
+        if _JS_CHALLENGE_RE.search(clean):
+            if not _js_challenge_warned:
+                _js_challenge_warned = True
+                print(
+                    f"\n  {yellow('⚠')}  JS challenge solving unavailable "
+                    f"{dim('(Node.js / Deno not found)')}\n"
+                    f"     Some formats may be missing — download may still succeed.\n"
+                    f"     Install Node.js to fully resolve: {dim('https://nodejs.org')}",
+                    file=sys.stderr,
+                )
+            return
+
         if _MUTED_RE.search(clean):
             return
         print(f"\n  {yellow('⚠')}  {dim(clean)}", file=sys.stderr)
@@ -246,9 +272,10 @@ def main() -> None:
         # Do NOT also set "embedthumbnail": True or it double-embeds
         "writethumbnail": embed_thumb,
 
-        # Use ios client: avoids both PO-Token and SABR warnings
+        # tv_embedded and android don't require JS challenge solving or PO tokens,
+        # making them safe fallbacks when Node.js / Deno is not installed.
         "extractor_args": {
-            "youtube": {"player_client": ["ios", "web"]},
+            "youtube": {"player_client": ["tv_embedded", "android"]},
         },
 
         "retries":          10,
