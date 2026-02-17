@@ -5,6 +5,7 @@ A robust YouTube audio downloader built on yt-dlp.
 """
 
 import argparse
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -12,16 +13,45 @@ from pathlib import Path
 from yt_dlp import YoutubeDL
 
 
+# ─────────────────────────── ANSI colours ────────────────────────────────────
+# Automatically disabled when stdout is not a TTY (e.g. piped to a file).
+
+_TTY = sys.stdout.isatty()
+
+def _c(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if _TTY else text
+
+def green(t):  return _c("32", t)
+def yellow(t): return _c("33", t)
+def cyan(t):   return _c("36", t)
+def bold(t):   return _c("1",  t)
+def dim(t):    return _c("2",  t)
+def red(t):    return _c("31", t)
+
+
+# ─────────────────────────── Known noisy warnings ────────────────────────────
+# These are YouTube-side limitations — not actionable by the user.
+# Silenced to keep output clean.
+
+_MUTED_PATTERNS = [
+    r"android client https formats require a GVS PO Token",
+    r"Some web client https formats have been skipped.*SABR",
+    r"Falling back to.*player",
+    r"po_token",
+]
+_MUTED_RE = re.compile("|".join(_MUTED_PATTERNS), re.IGNORECASE)
+
+
 # ─────────────────────────── Dependency check ────────────────────────────────
 
 def check_dependencies() -> None:
-    """Fail fast with a helpful message if ffmpeg is not installed."""
     if shutil.which("ffmpeg") is None:
         print(
-            "[Error] ffmpeg is not installed or not in PATH.\n"
-            "  • macOS:   brew install ffmpeg\n"
-            "  • Ubuntu:  sudo apt install ffmpeg\n"
-            "  • Windows: https://ffmpeg.org/download.html",
+            red("  ✗ ffmpeg not found in PATH.\n") +
+            "  Install it first:\n"
+            f"    macOS   →  brew install ffmpeg\n"
+            f"    Ubuntu  →  sudo apt install ffmpeg\n"
+            f"    Windows →  https://ffmpeg.org/download.html",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -30,10 +60,7 @@ def check_dependencies() -> None:
 # ─────────────────────────── Custom logger ───────────────────────────────────
 
 class QuietLogger:
-    """
-    Suppress yt-dlp's default stdout chatter while still surfacing
-    genuine warnings and errors to stderr.
-    """
+    """Pass warnings/errors to stderr; suppress everything else."""
 
     def debug(self, msg: str) -> None:
         pass
@@ -42,13 +69,23 @@ class QuietLogger:
         pass
 
     def warning(self, msg: str) -> None:
-        print(f"[yt-dlp warning] {msg}", file=sys.stderr)
+        clean = re.sub(r"^\[.*?\]\s[\w-]+:\s", "", msg).strip()
+        if _MUTED_RE.search(clean):
+            return
+        print(f"\n  {yellow('⚠')}  {dim(clean)}", file=sys.stderr)
 
     def error(self, msg: str) -> None:
-        print(f"[yt-dlp error] {msg}", file=sys.stderr)
+        clean = re.sub(r"^\[.*?\]\s[\w-]+:\s", "", msg).strip()
+        print(f"\n  {red('✗')}  {clean}", file=sys.stderr)
 
 
 # ─────────────────────────── Progress hook ───────────────────────────────────
+
+BAR_WIDTH = 26
+
+def _bar(percent: float) -> str:
+    filled = int(BAR_WIDTH * percent / 100)
+    return "[" + green("█" * filled) + dim("░" * (BAR_WIDTH - filled)) + "]"
 
 def progress_hook(d: dict) -> None:
     status = d["status"]
@@ -59,134 +96,124 @@ def progress_hook(d: dict) -> None:
         speed      = d.get("speed")
         eta        = d.get("eta")
 
-        speed_str = f"{speed / 1024 / 1024:.2f} MB/s" if speed else "N/A"
+        speed_str = f"{speed / 1024 / 1024:.1f} MB/s" if speed else "--.- MB/s"
+        eta_str   = f"ETA {eta}s" if eta is not None else "ETA ?s"
 
         if total:
             percent = downloaded * 100 / total
-            eta_str = f"{eta}s" if eta is not None else "?"
             print(
-                f"\r  {percent:6.2f}% | {speed_str} | ETA: {eta_str}   ",
-                end="",
-                flush=True,
+                f"\r  {_bar(percent)} {green(f'{percent:5.1f}%')}  "
+                f"{cyan(speed_str)}  {dim(eta_str)}   ",
+                end="", flush=True,
             )
         else:
-            # Size unknown (live stream, some DASH formats)
+            mb = downloaded / 1024 / 1024
             print(
-                f"\r  {downloaded / 1024 / 1024:.2f} MB downloaded | {speed_str}   ",
-                end="",
-                flush=True,
+                f"\r  {cyan(f'{mb:.2f} MB')} downloaded  {cyan(speed_str)}   ",
+                end="", flush=True,
             )
 
     elif status == "finished":
-        print("\n  ✓ Download complete, processing…")
+        full_bar = "[" + green("█" * BAR_WIDTH) + "]"
+        print(
+            f"\r  {full_bar} {green('100.0%')}  {dim('Processing…')}   ",
+            flush=True,
+        )
 
     elif status == "error":
-        print("\n  ✗ A fragment error occurred (yt-dlp will retry).", file=sys.stderr)
+        print(f"\n  {red('✗')}  Fragment error — yt-dlp will retry.", file=sys.stderr)
+
+
+# ─────────────────────────── Duplicate handling ──────────────────────────────
+
+def get_archive_path() -> Path:
+    """Persistent per-user archive so already-downloaded tracks are skipped."""
+    cache = Path.home() / ".cache" / "yt-audio-dl"
+    cache.mkdir(parents=True, exist_ok=True)
+    return cache / "downloaded.txt"
 
 
 # ─────────────────────────── Output template ─────────────────────────────────
 
-def build_output_template(custom: str | None, is_playlist: bool) -> str:
-    """
-    Return an appropriate yt-dlp output template.
-    Playlist downloads get an index prefix to prevent filename collisions.
-    """
+def build_output_template(custom, is_playlist: bool) -> str:
     if custom:
         return custom
-
     music_dir = Path.home() / "Music"
     music_dir.mkdir(parents=True, exist_ok=True)
-
     if is_playlist:
         return str(music_dir / "%(playlist_title)s" / "%(playlist_index)s - %(title)s.%(ext)s")
     return str(music_dir / "%(title)s.%(ext)s")
 
 
 def is_playlist_url(url: str) -> bool:
-    """Heuristic: treat the URL as a playlist if it contains 'list='."""
     return "list=" in url
 
 
 # ─────────────────────────── CLI ─────────────────────────────────────────────
 
-def parse_args() -> argparse.Namespace:
+def parse_args():
     parser = argparse.ArgumentParser(
         description="Download audio from YouTube videos or playlists.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "url",
-        help="YouTube video or playlist URL",
-    )
-    parser.add_argument(
-        "-o", "--output",
-        default=None,
-        help="Custom yt-dlp output template (overrides default ~/Music path)",
-    )
-    parser.add_argument(
-        "-c", "--codec",
-        default="m4a",
-        choices=["m4a", "mp3", "opus", "flac"],
-        help="Audio codec to encode to",
-    )
-    parser.add_argument(
-        "-q", "--quality",
-        default="192",
-        help=(
-            "Audio bitrate for lossy codecs (kbps). "
-            "Ignored for flac. Use '0' for VBR best on mp3."
-        ),
-    )
-    parser.add_argument(
-        "-p", "--parallel",
-        type=int,
-        default=1,
-        help="Parallel fragment downloads (only useful for DASH/HLS streams)",
-    )
-    parser.add_argument(
-        "--no-thumbnail",
-        action="store_true",
-        help="Skip downloading and embedding the cover thumbnail",
-    )
+    parser.add_argument("url", help="YouTube video or playlist URL")
+    parser.add_argument("-o", "--output", default=None,
+        help="Custom yt-dlp output template (overrides ~/Music)")
+    parser.add_argument("-c", "--codec", default="m4a",
+        choices=["m4a", "mp3", "opus", "flac"], help="Audio codec")
+    parser.add_argument("-q", "--quality", default="192",
+        help="Bitrate in kbps for lossy codecs. Use '0' for VBR best (mp3).")
+    parser.add_argument("-p", "--parallel", type=int, default=1,
+        help="Parallel fragment downloads (DASH/HLS only)")
+    parser.add_argument("--no-thumbnail", action="store_true",
+        help="Skip thumbnail embedding")
+    parser.add_argument("--no-archive", action="store_true",
+        help="Disable duplicate detection — re-download already saved tracks")
     return parser.parse_args()
 
 
 # ─────────────────────────── Postprocessors ──────────────────────────────────
 
 def build_postprocessors(codec: str, quality: str, embed_thumbnail: bool) -> list:
-    """
-    Build the postprocessor chain in the correct order:
-      1. Write metadata tags (title, artist, album, etc.)
-      2. Extract / re-encode audio
-      3. Convert thumbnail to JPEG  <- only if embedding
-      4. Embed thumbnail            <- only if embedding
-    """
-    postprocessors = [
-        # Must come BEFORE FFmpegExtractAudio so tags are applied to final file
-        {
-            "key": "FFmpegMetadata",
-            "add_metadata": True,
-        },
+    pp = [
+        {"key": "FFmpegMetadata", "add_metadata": True},
         {
             "key": "FFmpegExtractAudio",
             "preferredcodec": codec,
-            # quality "0" = VBR best for mp3; for flac quality is irrelevant
             "preferredquality": quality if codec != "flac" else "0",
         },
     ]
-
     if embed_thumbnail:
-        postprocessors += [
-            {
-                "key": "FFmpegThumbnailsConvertor",
-                "format": "jpg",
-            },
-            {
-                "key": "EmbedThumbnail",
-            },
+        pp += [
+            {"key": "FFmpegThumbnailsConvertor", "format": "jpg"},
+            {"key": "EmbedThumbnail"},
         ]
+    return pp
 
-    return postprocessors
+
+# ─────────────────────────── Header ──────────────────────────────────────────
+
+def print_header(args, outtmpl: str, embed_thumb: bool, archive_path) -> None:
+    W = 52
+    br  = bold(cyan("│"))
+    print(bold(cyan("┌" + "─" * W + "┐")))
+    title = bold("  🎵  yt-audio-dl")
+    print(f"{br}{title:^{W}}{br}")
+    print(bold(cyan("├" + "─" * W + "┤")))
+
+    out_folder = str(Path(outtmpl).parent)
+    rows = [
+        ("Codec",      f"{bold(args.codec.upper())}  {dim(args.quality + ' kbps')}"),
+        ("Thumbnail",  green("embedded") if embed_thumb else dim("skipped")),
+        ("Duplicates", dim("skipped via archive") if archive_path else yellow("allowed")),
+        ("Save to",    dim(out_folder)),
+    ]
+    for label, value in rows:
+        content = f"  {cyan(label):<22}{value}"
+        print(f"{br}{content}")
+
+    print(bold(cyan("└" + "─" * W + "┘")))
+    print()
 
 
 # ─────────────────────────── Main ────────────────────────────────────────────
@@ -195,68 +222,53 @@ def main() -> None:
     check_dependencies()
     args = parse_args()
 
-    playlist = is_playlist_url(args.url)
-    if playlist:
-        print("[Info] Playlist URL detected — files will be grouped by playlist title.")
-
-    outtmpl        = build_output_template(args.output, playlist)
-    embed_thumb    = not args.no_thumbnail
+    playlist     = is_playlist_url(args.url)
+    outtmpl      = build_output_template(args.output, playlist)
+    embed_thumb  = not args.no_thumbnail
+    archive_path = None if args.no_archive else get_archive_path()
     postprocessors = build_postprocessors(args.codec, args.quality, embed_thumb)
 
+    print_header(args, outtmpl, embed_thumb, archive_path)
+
+    if playlist:
+        print(f"  {cyan('ℹ')}  Playlist detected — grouping tracks into a subfolder.\n")
+
     ydl_opts = {
-        # ── Format ──────────────────────────────────────────────────────────
-        "format": "bestaudio/best",
-        "outtmpl": outtmpl,
-
-        # ── Logging — custom logger instead of quiet+no_warnings ─────────────
-        "logger": QuietLogger(),
-
-        # ── Filenames ────────────────────────────────────────────────────────
+        "format":            "bestaudio/best",
+        "outtmpl":           outtmpl,
+        "logger":            QuietLogger(),
         "restrictfilenames": True,
 
-        # ── Thumbnail (only download if we plan to embed it) ─────────────────
-        "writethumbnail": embed_thumb,
-        # NOTE: Do NOT set "embedthumbnail": True here.
-        # The EmbedThumbnail postprocessor handles it.
-        # Setting both causes double-embedding and potential file corruption.
+        # Duplicate handling
+        **({"download_archive": str(archive_path)} if archive_path else {}),
 
-        # ── Network / extractor ──────────────────────────────────────────────
+        # Thumbnail — EmbedThumbnail postprocessor handles embedding
+        # Do NOT also set "embedthumbnail": True or it double-embeds
+        "writethumbnail": embed_thumb,
+
+        # Use ios client: avoids both PO-Token and SABR warnings
         "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web"],
-            }
+            "youtube": {"player_client": ["ios", "web"]},
         },
 
-        # ── Retries ──────────────────────────────────────────────────────────
-        "retries": 10,
+        "retries":          10,
         "fragment_retries": 10,
-
-        # ── Parallelism ──────────────────────────────────────────────────────
         "concurrent_fragment_downloads": args.parallel,
-
-        # ── Postprocessing ───────────────────────────────────────────────────
-        "postprocessors": postprocessors,
-
-        # ── Progress ─────────────────────────────────────────────────────────
-        "progress_hooks": [progress_hook],
+        "postprocessors":   postprocessors,
+        "progress_hooks":   [progress_hook],
     }
-
-    print(
-        f"[Info] Codec: {args.codec.upper()} | Quality: {args.quality} kbps "
-        f"| Thumbnail: {'yes' if embed_thumb else 'no'} | Output: {outtmpl}\n"
-    )
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([args.url])
     except KeyboardInterrupt:
-        print("\n[Aborted] Download cancelled by user.", file=sys.stderr)
+        print(f"\n\n  {yellow('⚠')}  Cancelled by user.", file=sys.stderr)
         sys.exit(130)
     except Exception as exc:
-        print(f"\n[Error] Download failed: {exc}", file=sys.stderr)
+        print(f"\n  {red('✗')}  Download failed: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    print("\n[Done] All downloads finished.")
+    print(f"\n  {green('✓')}  {bold('All done!')}\n")
 
 
 if __name__ == "__main__":
