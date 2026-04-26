@@ -37,7 +37,7 @@ if __name__ == "__main__":
 
     # Ask user where to save
     print("Enter full path to save compressed image (Press Enter for default Downloads folder):")
-    save_path = input().strip()
+    save_path = input().strip().strip('"').strip("'")
 
     if not save_path:
         # Default to system Downloads folder
@@ -46,6 +46,7 @@ if __name__ == "__main__":
     else:
         # If user enters a folder, append filename
         if os.path.isdir(save_path):
+	    #os.makedirs(os.path.dirname(save_path), exist_ok=True)
             save_path = os.path.join(save_path, "compressed_" + os.path.basename(input_image))
 
     compress_image_to_target(input_image, save_path, target_size)

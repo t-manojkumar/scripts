@@ -1,0 +1,895 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ImagePress — Smart Compressor</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --glass-bg: rgba(255,255,255,0.18);
+    --glass-border: rgba(255,255,255,0.38);
+    --glass-shadow: rgba(0,0,0,0.18);
+    --glass-blur: 28px;
+    --glass-inner: rgba(255,255,255,0.08);
+    --accent: #4f8ef7;
+    --accent2: #a78bfa;
+    --accent-glow: rgba(79,142,247,0.38);
+    --success: #34d399;
+    --warning: #fbbf24;
+    --danger: #f87171;
+    --text-primary: rgba(255,255,255,0.96);
+    --text-secondary: rgba(255,255,255,0.62);
+    --text-muted: rgba(255,255,255,0.38);
+    --radius-sm: 8px;
+    --radius-md: 12px;
+    --radius-lg: 18px;
+    --radius-xl: 24px;
+  }
+
+  html, body {
+    min-height: 100vh;
+    font-family: 'DM Sans', sans-serif;
+    font-size: 14px;
+    color: var(--text-primary);
+    background: #0b0f1a;
+    overflow-x: hidden;
+  }
+
+  /* Animated mesh background */
+  .bg-mesh {
+    position: fixed; inset: 0; z-index: 0;
+    background:
+      radial-gradient(ellipse 80% 60% at 20% 10%, #1a2a6c 0%, transparent 60%),
+      radial-gradient(ellipse 60% 70% at 80% 80%, #0d3b6e 0%, transparent 60%),
+      radial-gradient(ellipse 50% 50% at 60% 30%, #162447 0%, transparent 55%),
+      linear-gradient(160deg, #060c1a 0%, #0d1b38 50%, #07111f 100%);
+  }
+  .bg-orb {
+    position: fixed; border-radius: 50%; filter: blur(80px); opacity: 0.55; pointer-events: none; z-index: 0;
+    animation: orbFloat 12s ease-in-out infinite alternate;
+  }
+  .bg-orb.a { width: 520px; height: 520px; left: -120px; top: -80px; background: radial-gradient(circle, #2d4de0 0%, transparent 70%); animation-delay: 0s; }
+  .bg-orb.b { width: 400px; height: 400px; right: -100px; bottom: -60px; background: radial-gradient(circle, #7c3aed 0%, transparent 70%); animation-delay: -4s; }
+  .bg-orb.c { width: 300px; height: 300px; left: 50%; top: 40%; background: radial-gradient(circle, #0ea5e9 0%, transparent 70%); opacity: 0.3; animation-delay: -8s; }
+
+  @keyframes orbFloat {
+    0% { transform: translate(0,0) scale(1); }
+    100% { transform: translate(30px, 25px) scale(1.08); }
+  }
+
+  /* Grid noise overlay */
+  .bg-grid {
+    position: fixed; inset: 0; z-index: 1; pointer-events: none;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+
+  /* Layout */
+  .page {
+    position: relative; z-index: 2;
+    min-height: 100vh;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    padding: 32px 16px;
+  }
+
+  /* App header */
+  .app-header {
+    text-align: center; margin-bottom: 28px;
+    animation: fadeUp 0.6s ease both;
+  }
+  .app-logo {
+    display: inline-flex; align-items: center; gap: 10px;
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    border-radius: 50px;
+    padding: 6px 18px 6px 10px;
+    backdrop-filter: blur(var(--glass-blur));
+    margin-bottom: 14px;
+  }
+  .logo-icon {
+    width: 28px; height: 28px; border-radius: 8px;
+    background: linear-gradient(135deg, #4f8ef7, #a78bfa);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px;
+  }
+  .logo-text { font-size: 13px; font-weight: 600; letter-spacing: -0.01em; }
+  .logo-badge {
+    font-size: 10px; font-weight: 500; color: var(--accent);
+    background: rgba(79,142,247,0.15); border: 1px solid rgba(79,142,247,0.3);
+    border-radius: 20px; padding: 1px 7px; margin-left: 4px;
+  }
+  .app-header h1 {
+    font-size: 34px; font-weight: 600; letter-spacing: -0.04em;
+    background: linear-gradient(135deg, #fff 20%, rgba(167,139,250,0.9) 80%);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    background-clip: text;
+    line-height: 1.1; margin-bottom: 8px;
+  }
+  .app-header p { font-size: 13px; color: var(--text-secondary); letter-spacing: 0.01em; }
+
+  /* Main glass window */
+  .window {
+    width: 100%; max-width: 560px;
+    background: rgba(255,255,255,0.09);
+    border: 1px solid rgba(255,255,255,0.22);
+    border-radius: var(--radius-xl);
+    backdrop-filter: blur(var(--glass-blur));
+    -webkit-backdrop-filter: blur(var(--glass-blur));
+    box-shadow:
+      0 32px 80px rgba(0,0,0,0.4),
+      0 0 0 0.5px rgba(255,255,255,0.12) inset,
+      0 1px 0 rgba(255,255,255,0.25) inset;
+    overflow: hidden;
+    animation: fadeUp 0.7s ease 0.1s both;
+  }
+
+  /* Titlebar */
+  .titlebar {
+    display: flex; align-items: center; gap: 7px;
+    padding: 14px 18px;
+    background: rgba(255,255,255,0.06);
+    border-bottom: 1px solid rgba(255,255,255,0.1);
+    user-select: none;
+  }
+  .dot { width: 12px; height: 12px; border-radius: 50%; cursor: pointer; transition: transform 0.15s, filter 0.15s; }
+  .dot:hover { transform: scale(1.15); filter: brightness(1.15); }
+  .dot.r { background: #ff5f57; box-shadow: 0 0 6px rgba(255,95,87,0.5); }
+  .dot.y { background: #ffbd2e; box-shadow: 0 0 6px rgba(255,189,46,0.4); }
+  .dot.g { background: #28c840; box-shadow: 0 0 6px rgba(40,200,64,0.4); }
+  .win-title {
+    flex: 1; text-align: center; font-size: 12.5px; font-weight: 500;
+    color: var(--text-secondary); letter-spacing: 0.01em;
+  }
+  .win-actions { display: flex; gap: 6px; }
+  .win-btn {
+    background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 6px; padding: 3px 9px; font-size: 11px; font-weight: 500;
+    color: var(--text-secondary); cursor: pointer; transition: all 0.15s;
+  }
+  .win-btn:hover { background: rgba(255,255,255,0.16); color: var(--text-primary); }
+
+  /* Body */
+  .win-body { padding: 22px 22px 20px; }
+
+  /* Drop zone */
+  .drop-zone {
+    position: relative;
+    border: 1.5px dashed rgba(255,255,255,0.22);
+    border-radius: var(--radius-lg);
+    padding: 36px 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.25s ease;
+    background: rgba(255,255,255,0.04);
+    overflow: hidden;
+  }
+  .drop-zone::before {
+    content: '';
+    position: absolute; inset: 0;
+    background: radial-gradient(ellipse at 50% 0%, rgba(79,142,247,0.12) 0%, transparent 70%);
+    opacity: 0; transition: opacity 0.3s;
+  }
+  .drop-zone:hover::before, .drop-zone.drag::before { opacity: 1; }
+  .drop-zone:hover, .drop-zone.drag {
+    border-color: rgba(79,142,247,0.6);
+    background: rgba(79,142,247,0.06);
+    box-shadow: 0 0 30px rgba(79,142,247,0.15) inset, 0 0 0 1px rgba(79,142,247,0.2);
+  }
+  .drop-zone input[type=file] {
+    position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+  }
+  .drop-icon-wrap {
+    width: 56px; height: 56px; border-radius: 16px; margin: 0 auto 14px;
+    background: linear-gradient(135deg, rgba(79,142,247,0.3), rgba(167,139,250,0.3));
+    border: 1px solid rgba(255,255,255,0.2);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 24px;
+    box-shadow: 0 8px 24px rgba(79,142,247,0.2);
+    transition: transform 0.2s, box-shadow 0.2s;
+  }
+  .drop-zone:hover .drop-icon-wrap { transform: translateY(-3px); box-shadow: 0 14px 30px rgba(79,142,247,0.3); }
+  .drop-title { font-size: 15px; font-weight: 600; color: var(--text-primary); margin-bottom: 5px; }
+  .drop-sub { font-size: 12px; color: var(--text-muted); }
+  .drop-formats {
+    display: flex; gap: 6px; justify-content: center; margin-top: 12px;
+    flex-wrap: wrap;
+  }
+  .fmt-badge {
+    font-size: 10px; font-weight: 600; letter-spacing: 0.06em;
+    padding: 3px 9px; border-radius: 20px;
+    background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.14);
+    color: var(--text-muted);
+  }
+
+  /* File pill */
+  .file-pill {
+    display: none; align-items: center; gap: 12px;
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.16);
+    border-radius: var(--radius-md);
+    padding: 10px 14px; margin-top: 12px;
+    animation: fadeUp 0.25s ease;
+  }
+  .file-pill.show { display: flex; }
+  .file-thumb {
+    width: 40px; height: 40px; border-radius: 8px; object-fit: cover;
+    border: 1px solid rgba(255,255,255,0.15);
+    background: rgba(255,255,255,0.05);
+    display: flex; align-items: center; justify-content: center; font-size: 18px;
+    overflow: hidden; flex-shrink: 0;
+  }
+  .file-thumb img { width: 100%; height: 100%; object-fit: cover; }
+  .file-meta { flex: 1; min-width: 0; }
+  .file-name { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .file-dims { font-size: 11px; color: var(--text-muted); margin-top: 2px; font-family: 'DM Mono', monospace; }
+  .file-x {
+    width: 22px; height: 22px; border-radius: 50%; background: rgba(255,255,255,0.1);
+    border: 1px solid rgba(255,255,255,0.15); display: flex; align-items: center; justify-content: center;
+    cursor: pointer; font-size: 10px; color: var(--text-secondary); flex-shrink: 0;
+    transition: background 0.15s;
+  }
+  .file-x:hover { background: rgba(248,113,113,0.3); color: #f87171; }
+
+  /* Divider */
+  .divider { height: 1px; background: rgba(255,255,255,0.08); margin: 18px 0; }
+
+  /* Section */
+  .section-label {
+    font-size: 10px; font-weight: 600; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--text-muted); margin-bottom: 12px;
+  }
+
+  /* Glass panel */
+  .glass-panel {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: var(--radius-md);
+    padding: 14px 16px;
+    margin-bottom: 10px;
+  }
+
+  /* Slider row */
+  .slider-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+  .slider-row:last-child { margin-bottom: 0; }
+  .slider-label { font-size: 12px; color: var(--text-secondary); min-width: 88px; }
+  .slider-wrap { flex: 1; position: relative; }
+  input[type=range] {
+    -webkit-appearance: none; appearance: none;
+    width: 100%; height: 4px; border-radius: 2px; outline: none; cursor: pointer;
+    background: rgba(255,255,255,0.12);
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 18px; height: 18px; border-radius: 50%; cursor: pointer;
+    background: white;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.35), 0 0 0 2px rgba(79,142,247,0.5);
+    transition: box-shadow 0.15s, transform 0.15s;
+  }
+  input[type=range]:hover::-webkit-slider-thumb { transform: scale(1.1); box-shadow: 0 2px 12px rgba(0,0,0,0.4), 0 0 0 3px rgba(79,142,247,0.6); }
+  .slider-val {
+    font-family: 'DM Mono', monospace; font-size: 12px; font-weight: 500;
+    background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 6px; padding: 2px 9px; min-width: 56px; text-align: center;
+    color: var(--text-primary);
+  }
+
+  /* Format selector */
+  .format-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 7px; }
+  .fmt-opt {
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: var(--radius-sm);
+    padding: 10px 8px; text-align: center; cursor: pointer;
+    background: rgba(255,255,255,0.05);
+    transition: all 0.18s;
+    user-select: none;
+  }
+  .fmt-opt:hover { background: rgba(255,255,255,0.1); border-color: rgba(255,255,255,0.22); }
+  .fmt-opt.active {
+    background: rgba(79,142,247,0.2);
+    border-color: rgba(79,142,247,0.55);
+    box-shadow: 0 0 16px rgba(79,142,247,0.2) inset;
+  }
+  .fmt-name { font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+  .fmt-desc { font-size: 10px; color: var(--text-muted); }
+  .fmt-opt.active .fmt-desc { color: rgba(79,142,247,0.9); }
+
+  /* Toggles */
+  .toggle-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .toggle-row:last-child { margin-bottom: 0; }
+  .toggle-label { flex: 1; font-size: 12.5px; color: var(--text-secondary); }
+  .toggle-sub { font-size: 10.5px; color: var(--text-muted); }
+  .toggle {
+    position: relative; width: 38px; height: 22px; flex-shrink: 0;
+    border-radius: 11px; cursor: pointer;
+    background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.15);
+    transition: background 0.22s, border-color 0.22s, box-shadow 0.22s;
+  }
+  .toggle.on { background: var(--accent); border-color: var(--accent); box-shadow: 0 0 12px rgba(79,142,247,0.5); }
+  .toggle::after {
+    content: ''; position: absolute;
+    width: 16px; height: 16px; border-radius: 50%; background: white;
+    top: 2px; left: 2px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+    transition: left 0.22s cubic-bezier(0.4,0,0.2,1);
+  }
+  .toggle.on::after { left: 18px; }
+
+  /* Stats row */
+  .stats-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 8px; margin-bottom: 14px; }
+  .stat-card {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: var(--radius-md);
+    padding: 12px 14px;
+    text-align: center; position: relative; overflow: hidden;
+    transition: border-color 0.3s;
+  }
+  .stat-card::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.15), transparent);
+  }
+  .stat-val { font-size: 20px; font-weight: 600; letter-spacing: -0.04em; color: var(--text-primary); font-family: 'DM Mono', monospace; }
+  .stat-val.c-blue { color: #60a5fa; }
+  .stat-val.c-green { color: #34d399; }
+  .stat-val.c-purple { color: #a78bfa; }
+  .stat-lbl { font-size: 10px; color: var(--text-muted); margin-top: 3px; text-transform: uppercase; letter-spacing: 0.07em; }
+
+  /* Progress */
+  .progress-section { margin-bottom: 14px; display: none; }
+  .progress-section.show { display: block; animation: fadeUp 0.25s ease; }
+  .progress-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .progress-status { font-size: 12px; color: var(--text-secondary); }
+  .progress-pct { font-size: 12px; font-weight: 600; color: var(--accent); font-family: 'DM Mono', monospace; }
+  .progress-track {
+    height: 6px; border-radius: 3px;
+    background: rgba(255,255,255,0.1);
+    overflow: hidden; position: relative;
+  }
+  .progress-fill {
+    height: 100%; width: 0%; border-radius: 3px;
+    background: linear-gradient(90deg, #4f8ef7, #a78bfa);
+    transition: width 0.15s ease;
+    position: relative;
+  }
+  .progress-fill::after {
+    content: ''; position: absolute; right: 0; top: 0; bottom: 0;
+    width: 40px;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.4));
+    animation: shimmer 1s linear infinite;
+  }
+  @keyframes shimmer { from { opacity: 0; } 50% { opacity: 1; } to { opacity: 0; } }
+
+  /* Log */
+  .log-panel {
+    background: rgba(0,0,0,0.25); border: 1px solid rgba(255,255,255,0.08);
+    border-radius: var(--radius-md);
+    padding: 10px 14px; font-family: 'DM Mono', monospace; font-size: 11px;
+    line-height: 1.7; max-height: 90px; overflow-y: auto;
+    color: var(--text-secondary); display: none; margin-bottom: 14px;
+    scroll-behavior: smooth;
+  }
+  .log-panel.show { display: block; animation: fadeUp 0.2s ease; }
+  .log-panel::-webkit-scrollbar { width: 3px; }
+  .log-panel::-webkit-scrollbar-track { background: transparent; }
+  .log-panel::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 2px; }
+  .log-line { display: flex; gap: 8px; }
+  .log-time { color: var(--text-muted); flex-shrink: 0; }
+  .log-line.ok .log-msg { color: var(--success); }
+  .log-line.warn .log-msg { color: var(--warning); }
+  .log-line.err .log-msg { color: var(--danger); }
+  .log-line.info .log-msg { color: #60a5fa; }
+
+  /* Buttons */
+  .btn-row { display: flex; gap: 8px; }
+  .btn {
+    flex: 1; padding: 11px 16px; border-radius: var(--radius-md);
+    font-size: 13.5px; font-weight: 600; cursor: pointer;
+    border: 1px solid transparent;
+    transition: all 0.18s; letter-spacing: -0.01em;
+    font-family: 'DM Sans', sans-serif;
+    display: flex; align-items: center; justify-content: center; gap: 7px;
+  }
+  .btn-ghost {
+    background: rgba(255,255,255,0.07);
+    border-color: rgba(255,255,255,0.12);
+    color: var(--text-secondary);
+  }
+  .btn-ghost:hover { background: rgba(255,255,255,0.12); color: var(--text-primary); }
+  .btn-primary {
+    background: linear-gradient(135deg, #4f8ef7, #6366f1);
+    border-color: rgba(79,142,247,0.4);
+    color: white;
+    box-shadow: 0 4px 20px rgba(79,142,247,0.35), 0 0 0 1px rgba(255,255,255,0.1) inset;
+  }
+  .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 8px 28px rgba(79,142,247,0.45), 0 0 0 1px rgba(255,255,255,0.15) inset; }
+  .btn-primary:active { transform: translateY(0) scale(0.98); }
+  .btn-primary:disabled {
+    background: rgba(255,255,255,0.1); border-color: rgba(255,255,255,0.08);
+    color: var(--text-muted); box-shadow: none; cursor: not-allowed; transform: none;
+  }
+  .btn-success {
+    background: linear-gradient(135deg, #059669, #34d399);
+    border-color: rgba(52,211,153,0.4);
+    color: white;
+    box-shadow: 0 4px 20px rgba(52,211,153,0.3);
+  }
+  .btn-success:hover { transform: translateY(-1px); box-shadow: 0 8px 28px rgba(52,211,153,0.4); }
+
+  /* Toast */
+  .toast {
+    position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%) translateY(80px);
+    background: rgba(30,40,70,0.92); backdrop-filter: blur(20px);
+    border: 1px solid rgba(255,255,255,0.18);
+    border-radius: 50px; padding: 10px 20px;
+    font-size: 13px; font-weight: 500; color: var(--text-primary);
+    display: flex; align-items: center; gap: 8px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    transition: transform 0.35s cubic-bezier(0.34,1.56,0.64,1), opacity 0.25s;
+    opacity: 0; z-index: 999; white-space: nowrap;
+  }
+  .toast.show { transform: translateX(-50%) translateY(0); opacity: 1; }
+  .toast-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--success); box-shadow: 0 0 8px var(--success); }
+  .toast-dot.warn { background: var(--warning); box-shadow: 0 0 8px var(--warning); }
+
+  /* Footer */
+  .app-footer {
+    margin-top: 20px; text-align: center;
+    font-size: 11px; color: var(--text-muted);
+    animation: fadeUp 0.7s ease 0.3s both;
+  }
+
+  /* Animations */
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(16px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* Scrollbar global */
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
+
+  /* Responsive */
+  @media (max-width: 600px) {
+    .win-body { padding: 16px; }
+    .stats-grid { grid-template-columns: repeat(3,1fr); }
+    .stat-val { font-size: 16px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="bg-mesh"></div>
+<div class="bg-orb a"></div>
+<div class="bg-orb b"></div>
+<div class="bg-orb c"></div>
+<div class="bg-grid"></div>
+
+<div class="page">
+  <!-- App header -->
+  <div class="app-header">
+    <div class="app-logo">
+      <div class="logo-icon">🗜️</div>
+      <span class="logo-text">ImagePress</span>
+      <span class="logo-badge">v2.0</span>
+    </div>
+    <h1>Smart Image Compressor</h1>
+    <p>Compress any image in your browser — private, fast, and beautiful.</p>
+  </div>
+
+  <!-- Main window -->
+  <div class="window">
+    <!-- Titlebar -->
+    <div class="titlebar">
+      <div class="dot r"></div>
+      <div class="dot y"></div>
+      <div class="dot g"></div>
+      <span class="win-title">ImagePress — Ready</span>
+      <div class="win-actions">
+        <div class="win-btn" onclick="resetAll()">Reset</div>
+      </div>
+    </div>
+
+    <div class="win-body">
+
+      <!-- Drop zone -->
+      <div class="drop-zone" id="dropZone">
+        <input type="file" accept="image/*" id="fileInput" />
+        <div class="drop-icon-wrap">🖼️</div>
+        <div class="drop-title">Drop your image here</div>
+        <div class="drop-sub">or click to browse from your device</div>
+        <div class="drop-formats">
+          <span class="fmt-badge">JPEG</span>
+          <span class="fmt-badge">PNG</span>
+          <span class="fmt-badge">WebP</span>
+          <span class="fmt-badge">TIFF</span>
+          <span class="fmt-badge">BMP</span>
+          <span class="fmt-badge">GIF</span>
+        </div>
+      </div>
+
+      <!-- File pill -->
+      <div class="file-pill" id="filePill">
+        <div class="file-thumb" id="fileThumb"></div>
+        <div class="file-meta">
+          <div class="file-name" id="fileName">—</div>
+          <div class="file-dims" id="fileDims">—</div>
+        </div>
+        <div class="file-x" id="fileRemove">✕</div>
+      </div>
+
+      <div class="divider"></div>
+
+      <!-- Settings -->
+      <div class="section-label">Output Format</div>
+      <div class="format-grid" style="margin-bottom:18px;">
+        <div class="fmt-opt active" data-fmt="jpeg">
+          <div class="fmt-name">JPEG</div>
+          <div class="fmt-desc">Best size</div>
+        </div>
+        <div class="fmt-opt" data-fmt="webp">
+          <div class="fmt-name">WebP</div>
+          <div class="fmt-desc">Modern</div>
+        </div>
+        <div class="fmt-opt" data-fmt="png">
+          <div class="fmt-name">PNG</div>
+          <div class="fmt-desc">Lossless</div>
+        </div>
+      </div>
+
+      <div class="section-label">Compression Settings</div>
+      <div class="glass-panel" style="margin-bottom:10px;">
+        <div class="slider-row">
+          <span class="slider-label">Target size</span>
+          <div class="slider-wrap">
+            <input type="range" id="targetSize" min="0.1" max="25" step="0.1" value="5" />
+          </div>
+          <span class="slider-val" id="targetSizeVal">5.0 MB</span>
+        </div>
+        <div class="slider-row">
+          <span class="slider-label">Min quality</span>
+          <div class="slider-wrap">
+            <input type="range" id="minQuality" min="5" max="80" step="5" value="15" />
+          </div>
+          <span class="slider-val" id="minQualityVal">15</span>
+        </div>
+      </div>
+
+      <div class="glass-panel" style="margin-bottom:18px;">
+        <div class="toggle-row">
+          <div>
+            <div class="toggle-label">Resize if still over limit</div>
+            <div class="toggle-sub">Scales down dimensions as a last resort</div>
+          </div>
+          <div class="toggle on" id="toggleResize"></div>
+        </div>
+        <div class="toggle-row">
+          <div>
+            <div class="toggle-label">Strip EXIF metadata</div>
+            <div class="toggle-sub">Removes GPS, camera info for privacy</div>
+          </div>
+          <div class="toggle on" id="toggleExif"></div>
+        </div>
+      </div>
+
+      <!-- Stats -->
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-val c-blue" id="statOrig">—</div>
+          <div class="stat-lbl">Original</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-val c-green" id="statOut">—</div>
+          <div class="stat-lbl">Output</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-val c-purple" id="statSave">—</div>
+          <div class="stat-lbl">Saved</div>
+        </div>
+      </div>
+
+      <!-- Progress -->
+      <div class="progress-section" id="progressSection">
+        <div class="progress-header">
+          <span class="progress-status" id="progressStatus">Processing…</span>
+          <span class="progress-pct" id="progressPct">0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="progressFill"></div>
+        </div>
+      </div>
+
+      <!-- Log -->
+      <div class="log-panel" id="logPanel"></div>
+
+      <!-- Buttons -->
+      <div class="btn-row">
+        <button class="btn btn-ghost" onclick="resetAll()">
+          <span>↺</span> Reset
+        </button>
+        <button class="btn btn-primary" id="compressBtn" disabled>
+          <span>⚡</span> Compress &amp; Download
+        </button>
+      </div>
+
+    </div>
+  </div>
+
+  <div class="app-footer">
+    100% client-side · No uploads · No server · Your files never leave your browser
+  </div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast">
+  <div class="toast-dot" id="toastDot"></div>
+  <span id="toastMsg">Done!</span>
+</div>
+
+<script>
+  // --- State ---
+  let selectedFile = null;
+  let selectedFmt = 'jpeg';
+  let resizeEnabled = true;
+  let exifEnabled = true;
+  let compressing = false;
+
+  // --- Elements ---
+  const fileInput = document.getElementById('fileInput');
+  const dropZone = document.getElementById('dropZone');
+  const filePill = document.getElementById('filePill');
+  const fileThumb = document.getElementById('fileThumb');
+  const fileName = document.getElementById('fileName');
+  const fileDims = document.getElementById('fileDims');
+  const fileRemove = document.getElementById('fileRemove');
+  const compressBtn = document.getElementById('compressBtn');
+  const targetSizeSlider = document.getElementById('targetSize');
+  const targetSizeVal = document.getElementById('targetSizeVal');
+  const minQSlider = document.getElementById('minQuality');
+  const minQVal = document.getElementById('minQualityVal');
+  const toggleResize = document.getElementById('toggleResize');
+  const toggleExif = document.getElementById('toggleExif');
+  const progressSection = document.getElementById('progressSection');
+  const progressFill = document.getElementById('progressFill');
+  const progressStatus = document.getElementById('progressStatus');
+  const progressPct = document.getElementById('progressPct');
+  const logPanel = document.getElementById('logPanel');
+  const statOrig = document.getElementById('statOrig');
+  const statOut = document.getElementById('statOut');
+  const statSave = document.getElementById('statSave');
+  const winTitle = document.querySelector('.win-title');
+
+  // --- Helpers ---
+  const fmtSize = b => b < 1024 ? b + ' B' : b < 1048576 ? (b/1024).toFixed(0) + ' KB' : (b/1048576).toFixed(2) + ' MB';
+  const now = () => { const d = new Date(); return d.toTimeString().slice(0,8); };
+
+  function setProgress(pct, status) {
+    progressSection.classList.add('show');
+    progressFill.style.width = Math.min(100, pct) + '%';
+    progressStatus.textContent = status;
+    progressPct.textContent = Math.round(pct) + '%';
+  }
+
+  function log(msg, type = '') {
+    logPanel.classList.add('show');
+    const line = document.createElement('div');
+    line.className = 'log-line' + (type ? ' ' + type : '');
+    line.innerHTML = `<span class="log-time">${now()}</span><span class="log-msg">${msg}</span>`;
+    logPanel.appendChild(line);
+    logPanel.scrollTop = logPanel.scrollHeight;
+  }
+
+  function showToast(msg, warn = false) {
+    const toast = document.getElementById('toast');
+    const dot = document.getElementById('toastDot');
+    document.getElementById('toastMsg').textContent = msg;
+    dot.className = 'toast-dot' + (warn ? ' warn' : '');
+    toast.classList.add('show');
+    setTimeout(() => toast.classList.remove('show'), 3200);
+  }
+
+  // --- Format selector ---
+  document.querySelectorAll('.fmt-opt').forEach(opt => {
+    opt.addEventListener('click', () => {
+      document.querySelectorAll('.fmt-opt').forEach(o => o.classList.remove('active'));
+      opt.classList.add('active');
+      selectedFmt = opt.dataset.fmt;
+      const isPng = selectedFmt === 'png';
+      minQSlider.disabled = isPng;
+      minQVal.style.opacity = isPng ? '0.4' : '1';
+      targetSizeSlider.disabled = isPng;
+      targetSizeVal.style.opacity = isPng ? '0.4' : '1';
+    });
+  });
+
+  // --- Toggles ---
+  toggleResize.onclick = () => { resizeEnabled = !resizeEnabled; toggleResize.classList.toggle('on', resizeEnabled); };
+  toggleExif.onclick = () => { exifEnabled = !exifEnabled; toggleExif.classList.toggle('on', exifEnabled); };
+
+  // --- Sliders ---
+  targetSizeSlider.oninput = () => {
+    const v = parseFloat(targetSizeSlider.value);
+    targetSizeVal.textContent = v < 1 ? (v*1000).toFixed(0) + ' KB' : v.toFixed(1) + ' MB';
+  };
+  minQSlider.oninput = () => minQVal.textContent = minQSlider.value;
+
+  // --- Drag & drop ---
+  dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag'); });
+  dropZone.addEventListener('dragleave', e => { if (!dropZone.contains(e.relatedTarget)) dropZone.classList.remove('drag'); });
+  dropZone.addEventListener('drop', e => { e.preventDefault(); dropZone.classList.remove('drag'); if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); });
+  fileInput.addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+
+  // --- Load file ---
+  function loadFile(file) {
+    if (!file.type.startsWith('image/')) { showToast('Not a valid image file', true); return; }
+    selectedFile = file;
+    fileName.textContent = file.name;
+    statOrig.textContent = fmtSize(file.size);
+    statOut.textContent = '—'; statSave.textContent = '—';
+    filePill.classList.add('show');
+    compressBtn.disabled = false;
+    winTitle.textContent = 'ImagePress — ' + file.name;
+
+    // Thumbnail + dimensions
+    const reader = new FileReader();
+    reader.onload = ev => {
+      const img = new Image();
+      img.onload = () => {
+        const thumb = document.createElement('img');
+        thumb.src = ev.target.result;
+        fileThumb.innerHTML = '';
+        fileThumb.appendChild(thumb);
+        fileDims.textContent = `${img.naturalWidth} × ${img.naturalHeight}px · ${fmtSize(file.size)}`;
+      };
+      img.src = ev.target.result;
+    };
+    reader.readAsDataURL(file);
+    logPanel.innerHTML = ''; logPanel.classList.remove('show');
+    progressSection.classList.remove('show');
+  }
+
+  fileRemove.onclick = () => resetAll();
+
+  // --- Reset ---
+  function resetAll() {
+    selectedFile = null;
+    fileInput.value = '';
+    filePill.classList.remove('show');
+    fileThumb.innerHTML = '';
+    compressBtn.disabled = true;
+    statOrig.textContent = '—'; statOut.textContent = '—'; statSave.textContent = '—';
+    logPanel.innerHTML = ''; logPanel.classList.remove('show');
+    progressSection.classList.remove('show');
+    progressFill.style.width = '0%';
+    winTitle.textContent = 'ImagePress — Ready';
+    compressBtn.className = 'btn btn-primary';
+    compressBtn.innerHTML = '<span>⚡</span> Compress &amp; Download';
+  }
+
+  // --- Compress ---
+  compressBtn.addEventListener('click', async () => {
+    if (!selectedFile || compressing) return;
+    compressing = true;
+    compressBtn.disabled = true;
+    logPanel.innerHTML = '';
+    logPanel.classList.add('show');
+    progressSection.classList.add('show');
+    compressBtn.innerHTML = '<span>⏳</span> Compressing…';
+
+    const targetBytes = parseFloat(targetSizeSlider.value) * 1024 * 1024;
+    const minQ = parseInt(minQSlider.value) / 100;
+    const fmt = selectedFmt;
+    const mimeMap = { jpeg: 'image/jpeg', webp: 'image/webp', png: 'image/png' };
+    const mimeType = mimeMap[fmt];
+    const extMap = { jpeg: 'jpg', webp: 'webp', png: 'png' };
+    const origSize = selectedFile.size;
+
+    log('Loading image into canvas…', 'info');
+    setProgress(5, 'Loading image…');
+
+    const dataUrl = await new Promise(res => {
+      const r = new FileReader();
+      r.onload = e => res(e.target.result);
+      r.readAsDataURL(selectedFile);
+    });
+
+    const img = new Image();
+    await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = dataUrl; });
+
+    log(`Loaded: ${img.naturalWidth}×${img.naturalHeight}px`, 'ok');
+    setProgress(18, 'Preparing canvas…');
+
+    let cw = img.naturalWidth, ch = img.naturalHeight;
+    let canvas = document.createElement('canvas');
+    canvas.width = cw; canvas.height = ch;
+    canvas.getContext('2d').drawImage(img, 0, 0);
+
+    let blob = null;
+    let quality = 0.96;
+    let iterations = 0;
+
+    if (fmt === 'png') {
+      log('PNG is lossless — exporting directly.', 'warn');
+      setProgress(60, 'Exporting PNG…');
+      blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
+    } else {
+      // Binary search quality
+      let lo = minQ, hi = 0.96, bestBlob = null;
+      log(`Starting quality scan (target: ${fmtSize(targetBytes)})…`, 'info');
+
+      while (hi - lo > 0.03 && iterations < 14) {
+        quality = parseFloat(((lo + hi) / 2).toFixed(2));
+        blob = await new Promise(r => canvas.toBlob(r, mimeType, quality));
+        iterations++;
+        const pct = 18 + Math.min(iterations / 14, 1) * 45;
+        setProgress(pct, `Pass ${iterations}: Q${Math.round(quality*100)} → ${fmtSize(blob.size)}`);
+        log(`Pass ${iterations}: quality ${Math.round(quality*100)} → ${fmtSize(blob.size)}`, blob.size <= targetBytes ? 'ok' : '');
+        if (blob.size <= targetBytes) { bestBlob = blob; lo = quality; }
+        else { hi = quality; }
+      }
+
+      if (!bestBlob) {
+        // Fallback: use lowest quality tried
+        quality = minQ;
+        blob = await new Promise(r => canvas.toBlob(r, mimeType, quality));
+        bestBlob = blob;
+        log(`Min quality hit (${Math.round(minQ*100)}): ${fmtSize(blob.size)}`, 'warn');
+      }
+      blob = bestBlob;
+
+      // Resize fallback
+      if (blob.size > targetBytes && resizeEnabled) {
+        log('Still over target — entering resize mode…', 'warn');
+        setProgress(65, 'Resizing dimensions…');
+        let scale = 0.85;
+        while (blob.size > targetBytes && scale >= 0.15) {
+          const nw = Math.round(img.naturalWidth * scale);
+          const nh = Math.round(img.naturalHeight * scale);
+          const c2 = document.createElement('canvas');
+          c2.width = nw; c2.height = nh;
+          c2.getContext('2d').drawImage(img, 0, 0, nw, nh);
+          blob = await new Promise(r => c2.toBlob(r, mimeType, quality));
+          log(`Resize ${Math.round(scale*100)}%: ${nw}×${nh} → ${fmtSize(blob.size)}`, blob.size <= targetBytes ? 'ok' : '');
+          setProgress(65 + (0.85 - scale) / 0.7 * 20, `Resizing: ${nw}×${nh}`);
+          if (blob.size <= targetBytes) break;
+          scale = parseFloat((scale - 0.1).toFixed(2));
+        }
+      }
+    }
+
+    setProgress(94, 'Saving file…');
+
+    // Download
+    const baseName = selectedFile.name.replace(/\.[^.]+$/, '');
+    const outName = `compressed_${baseName}.${extMap[fmt]}`;
+    const blobUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = blobUrl; a.download = outName; a.click();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
+
+    const saved = origSize - blob.size;
+    const savedPct = Math.max(0, Math.round(saved / origSize * 100));
+    statOut.textContent = fmtSize(blob.size);
+    statSave.textContent = savedPct > 0 ? `-${savedPct}%` : '0%';
+
+    setProgress(100, `Done! Saved as ${outName}`);
+    log(`✔ Saved: ${outName} · ${fmtSize(blob.size)} · −${savedPct}% · Q${Math.round(quality*100)}`, 'ok');
+    winTitle.textContent = 'ImagePress — Done ✓';
+
+    compressBtn.disabled = false;
+    compressBtn.className = 'btn btn-success';
+    compressBtn.innerHTML = '<span>↓</span> Download Again';
+    compressBtn.onclick = () => { const a2 = document.createElement('a'); a2.href = blobUrl; a2.download = outName; a2.click(); };
+
+    showToast(`Saved ${savedPct}% — ${fmtSize(blob.size)}`);
+    compressing = false;
+  });
+</script>
+</body>
+</html>
