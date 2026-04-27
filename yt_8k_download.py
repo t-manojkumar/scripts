@@ -89,7 +89,12 @@ while True:
         # ---------- Download ----------
         outtmpl = os.path.join(save_folder, '%(title)s.%(ext)s')
         ydl_opts_download = {
-            'format': f'bestvideo[vcodec*={selected_codec}][height={desired_res}]+bestaudio/best',
+            'format': (
+                f'bestvideo[vcodec*={selected_codec}][height<={desired_res}]+bestaudio/'
+                f'bestvideo[height<={desired_res}]+bestaudio/'
+                f'best[height<={desired_res}]'
+            ),
+            'merge_output_format': 'mp4',
             'outtmpl': outtmpl,
             'progress_hooks': [progress_hook],
             'quiet': True,
