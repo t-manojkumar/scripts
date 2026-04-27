@@ -1,33 +1,41 @@
 #!/usr/bin/env python3
 """
 GPU-Accelerated Video Frame Extractor
-- fp16 CUDA scoring with Sobel/Laplacian conv2d kernels
-- Memory-bounded top-N min-heap (O(N) RAM, not O(all frames))
-- Async parallel writes via ThreadPoolExecutor
-- Pinned memory + non_blocking H2D transfers
-- Hardware video decoding (NVDEC/QSV auto-detect)
-- Pre-allocated read buffer (no per-frame bytes alloc)
-- Pre-warmed CUDA kernels
+Optimizations:
+  - Pre-allocated pinned batch tensor → 1 copy per frame (not 2)
+  - fp16 CUDA scoring via F.conv2d Sobel/Laplacian kernels
+  - torch.no_grad() eliminates autograd graph overhead
+  - Fused .to(device, dtype=fp16, non_blocking=True) → single GPU op
+  - CUDA stream; .cpu() inside context (no redundant stream.synchronize)
+  - Bounded top-N min-heap: O(N) RAM regardless of video length
+  - Async parallel writes via ThreadPoolExecutor
+  - 128px thumbnail for duplicate detection (100x fewer pixels than score res)
+  - Hardware video decoding (NVDEC/QSV, probed once)
+  - Pre-warmed CUDA kernels (no first-batch JIT stall)
+  - Reliable readinto loop (no partial-frame reads)
+  - FFmpeg -threads 0 (auto-threaded demux/decode)
 """
 
-import subprocess
-import numpy as np
-import torch
-import torch.nn.functional as F
-import cv2
+import contextlib
+import heapq
+import json
 import os
 import re
 import signal
+import subprocess
 import sys
-import heapq
-import json
-import contextlib
+import traceback
 from concurrent.futures import ThreadPoolExecutor
-from tqdm import tqdm
 from pathlib import Path
 
-# ── Global state for cleanup ──────────────────────────────────────────────────
-pipe_process = None
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+from tqdm import tqdm
+
+# ── Global state for signal-handler cleanup ───────────────────────────────────
+pipe_process    = None
 _write_executor = None
 
 
@@ -48,10 +56,9 @@ signal.signal(signal.SIGINT, signal_handler)
 def check_dependencies():
     for tool in ("ffmpeg", "ffprobe"):
         try:
-            subprocess.run(
-                [tool, "-version"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
-            )
+            subprocess.run([tool, "-version"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           check=True)
         except (subprocess.CalledProcessError, FileNotFoundError):
             print(f"[ERROR] {tool} not found. Please install FFmpeg.")
             sys.exit(1)
@@ -61,10 +68,8 @@ def check_dependencies():
 def ffprobe(video):
     if not os.path.exists(video):
         raise FileNotFoundError(f"Video not found: {video}")
-
     cmd = [
-        "ffprobe", "-v", "error",
-        "-select_streams", "v:0",
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
         "-show_entries",
         "stream=codec_name,width,height,avg_frame_rate,pix_fmt,nb_frames"
         ":format=duration",
@@ -79,8 +84,7 @@ def ffprobe(video):
     streams = data.get("streams", [])
     if not streams:
         raise RuntimeError("No video stream found")
-
-    s = streams[0]
+    s       = streams[0]
     codec   = s.get("codec_name", "unknown")
     W, H    = int(s.get("width", 0)), int(s.get("height", 0))
     pix_fmt = s.get("pix_fmt", "unknown")
@@ -95,8 +99,9 @@ def ffprobe(video):
     duration = 0.0
     for src in (data.get("format", {}), s):
         try:
-            duration = float(src.get("duration", 0))
-            if duration > 0:
+            v = float(src.get("duration", 0))
+            if v > 0:
+                duration = v
                 break
         except (ValueError, TypeError):
             pass
@@ -114,24 +119,19 @@ def ffprobe(video):
 def detect_hardware_decoder(codec, use_gpu):
     if not use_gpu:
         return None
-
     candidates = {
         "h264": ["h264_cuvid", "h264_qsv"],
         "hevc": ["hevc_cuvid", "hevc_qsv"],
         "vp9":  ["vp9_cuvid",  "vp9_qsv"],
         "av1":  ["av1_cuvid",  "av1_qsv"],
     }.get(codec, [])
-
     if not candidates:
         return None
-
     try:
-        result = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-decoders"],
-            capture_output=True, text=True, timeout=5
-        )
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-decoders"],
+                           capture_output=True, text=True, timeout=5)
         for dec in candidates:
-            if dec in result.stdout:
+            if dec in r.stdout:
                 return dec
     except Exception:
         pass
@@ -150,10 +150,10 @@ def detect_resume_index(out_dir, ext):
     return max_idx + 1
 
 
-# ── Reliable pipe reader (avoids partial-read on large frames) ────────────────
+# ── Reliable pipe reader ──────────────────────────────────────────────────────
 def read_frame_exact(stream, buf, size):
-    """Fill buf[:size] from stream. Returns True on success, False on EOF."""
-    mv = memoryview(buf)
+    """Fill buf[:size] from pipe. Returns True on success, False on EOF."""
+    mv  = memoryview(buf)
     pos = 0
     while pos < size:
         n = stream.readinto(mv[pos:size])
@@ -166,14 +166,14 @@ def read_frame_exact(stream, buf, size):
 # ── Bounded top-N min-heap ────────────────────────────────────────────────────
 class TopNHeap:
     """
-    Keeps the best N (score, frame) pairs in memory.
-    Worst-scoring frame is evicted when N is exceeded — O(log N) per insert.
-    Peak RAM = N * frame_bytes, not all_frames * frame_bytes.
+    Retains only the best N frames by score.
+    Evicts the worst entry when a higher-scored frame arrives.
+    Peak RAM = N × frame_bytes  (independent of video length).
     """
 
     def __init__(self, n):
-        self.n = n
-        self._heap = []    # (score, counter, idx, frame_bgr_or_None)
+        self.n        = n
+        self._heap    = []
         self._counter = 0
 
     def offer(self, score, idx, frame_bgr):
@@ -183,7 +183,7 @@ class TopNHeap:
             heapq.heappush(self._heap, entry)
         elif score > self._heap[0][0]:
             heapq.heapreplace(self._heap, entry)
-        # else: below current worst — discard immediately (GC will free frame)
+        # else: below current worst → discarded, frame GC'd immediately
 
     def sorted_top(self):
         return [(s, idx, fr) for s, _, idx, fr in sorted(self._heap, reverse=True)]
@@ -191,56 +191,53 @@ class TopNHeap:
     def __len__(self):
         return len(self._heap)
 
-    def worst_score(self):
-        return self._heap[0][0] if self._heap else float("-inf")
 
-
-# ── Cached convolution kernels (allocated once per device) ───────────────────
+# ── Kernel cache (allocated once per device/dtype) ────────────────────────────
 _kernels: dict = {}
 
 
 def _get_kernels(device, dtype):
-    key = (device.type, device.index, dtype)
+    key = (str(device), dtype)
     if key not in _kernels:
         kw = dict(dtype=dtype, device=device)
         _kernels[key] = (
-            torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], **kw).view(1, 1, 3, 3),  # Sobel-X
-            torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], **kw).view(1, 1, 3, 3),  # Sobel-Y
-            torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], **kw).view(1, 1, 3, 3),    # Laplacian
+            torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], **kw).view(1, 1, 3, 3),
+            torch.tensor([[-1,-2,-1], [ 0, 0, 0], [ 1, 2, 1]], **kw).view(1, 1, 3, 3),
+            torch.tensor([[ 0, 1, 0], [ 1,-4, 1], [ 0, 1, 0]], **kw).view(1, 1, 3, 3),
         )
-    return _kernels[key]
+    return _kernels[key]   # Sobel-X, Sobel-Y, Laplacian
 
 
-# ── GPU batch scoring ─────────────────────────────────────────────────────────
-def score_batch(frames_np, device, stream=None):
+# ── Batch scoring ─────────────────────────────────────────────────────────────
+def score_batch(buf, n, device, stream=None):
     """
-    Score BGR uint8 frames (list of H×W×3 arrays) on device.
-    fp16 on CUDA (~2× memory bandwidth vs fp32), fp32 on CPU.
-    Returns list[float] of quality scores.
-    """
-    arr = np.stack(frames_np)   # (N, H, W, 3) uint8
+    buf    : (B, H, W, 3) uint8 — pinned torch.Tensor (CUDA) or np.ndarray (CPU).
+    n      : number of valid frames in buf.
+    stream : optional torch.cuda.Stream for pipeline overlap.
 
+    fp16 on CUDA (~2× memory bandwidth), fp32 on CPU.
+    torch.no_grad() prevents autograd graph construction.
+    Fused .to(device, dtype=fp16) is a single GPU kernel (not two).
+    .cpu() inside the stream context is the correct sync point — no explicit
+    stream.synchronize() needed.
+    """
     ctx = (torch.cuda.stream(stream)
            if (stream is not None and device.type == "cuda")
            else contextlib.nullcontext())
 
-    with ctx:
+    with torch.no_grad(), ctx:
         if device.type == "cuda":
-            # Pinned host memory → fast async DMA to VRAM
-            t = torch.from_numpy(arr).pin_memory().to(device, non_blocking=True).half()
-            dtype = torch.float16
+            # buf is pre-allocated pinned memory → non_blocking DMA + fused fp16 cast
+            t = buf[:n].to(device=device, dtype=torch.float16, non_blocking=True)
         else:
-            t = torch.from_numpy(arr).float()
-            dtype = torch.float32
+            t = torch.from_numpy(np.asarray(buf[:n])).float()
 
         # NHWC BGR → NCHW, normalize [0, 1]
-        t = t.permute(0, 3, 1, 2).div_(255.0)
+        t    = t.permute(0, 3, 1, 2).div_(255.0)
+        gray = 0.299 * t[:, 2] + 0.587 * t[:, 1] + 0.114 * t[:, 0]
+        g    = gray.unsqueeze(1)
 
-        # Perceptual grayscale from BGR channels
-        gray = 0.299 * t[:, 2] + 0.587 * t[:, 1] + 0.114 * t[:, 0]  # (N, H, W)
-        g    = gray.unsqueeze(1)                                        # (N, 1, H, W)
-
-        sx, sy, lk = _get_kernels(device, dtype)
+        sx, sy, lk = _get_kernels(device, t.dtype)
 
         lap  = F.conv2d(g, lk, padding=1).squeeze(1).abs()
         gx   = F.conv2d(g, sx, padding=1).squeeze(1)
@@ -248,19 +245,17 @@ def score_batch(frames_np, device, stream=None):
         grad = torch.sqrt(gx.pow(2) + gy.pow(2))
 
         brightness = gray.mean(dim=(1, 2))
-        is_black   = (brightness < (10.0 / 255.0)).to(dtype)
+        is_black   = (brightness < (10.0 / 255.0)).to(t.dtype)
 
         score = (
-            0.50 * lap.var(dim=(1, 2))          +  # sharpness
-            0.30 * grad.mean(dim=(1, 2))         +  # edge strength
-            0.20 * gray.std(dim=(1, 2))          -  # contrast
-            0.10 * (brightness - 0.5).abs()      -  # exposure
-            1000.0 * is_black                       # penalise black frames
+            0.50 * lap.var(dim=(1, 2))      +   # sharpness
+            0.30 * grad.mean(dim=(1, 2))    +   # edge strength
+            0.20 * gray.std(dim=(1, 2))     -   # contrast
+            0.10 * (brightness - 0.5).abs() -   # exposure penalty
+            1000.0 * is_black                   # black-frame penalty
         )
 
-        if stream is not None and device.type == "cuda":
-            stream.synchronize()
-
+        # .cpu() inside the stream context → correctly ordered D2H DMA (no separate sync)
         return score.float().cpu().tolist()
 
 
@@ -268,17 +263,17 @@ def score_batch(frames_np, device, stream=None):
 def is_duplicate(frame, prev, threshold=0.98):
     if prev is None:
         return False
-    diff = np.abs(frame.astype(np.float32) - prev.astype(np.float32)).mean()
-    return diff < (255.0 * (1.0 - threshold))
+    return (np.abs(frame.astype(np.float32) - prev.astype(np.float32)).mean()
+            < 255.0 * (1.0 - threshold))
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     global pipe_process, _write_executor
 
-    print("=" * 56)
+    print("=" * 58)
     print("  GPU-ACCELERATED VIDEO FRAME EXTRACTOR")
-    print("=" * 56)
+    print("=" * 58)
 
     check_dependencies()
 
@@ -289,7 +284,7 @@ def main():
 
     print("\nOutput format:")
     print("  1 → JPG  (smaller, lossy)")
-    print("  2 → PNG  (lossless, max quality)  [default]")
+    print("  2 → PNG  (lossless)  [default]")
     print("  3 → WEBP (balanced)")
     fmt_choice = input("Choice [2]: ").strip() or "2"
     format_map = {
@@ -306,27 +301,28 @@ def main():
         print(f"[ERROR] {e}")
         return
 
-    print(f"\n{'─' * 56}")
-    print(f"  Codec     : {codec.upper()}")
-    print(f"  Resolution: {W}×{H}")
-    print(f"  FPS       : {fps:.3f}")
-    print(f"  Duration  : {duration:.1f}s  ({duration/60:.1f} min)")
-    print(f"  Pixel fmt : {pix_fmt}")
-    print(f"{'─' * 56}")
+    print(f"\n{'─' * 58}")
+    print(f"  {codec.upper()}  {W}×{H}  {fps:.3f} fps  {duration:.1f}s ({duration/60:.1f} min)")
+    print(f"  Pixel format: {pix_fmt}")
+    print(f"{'─' * 58}")
 
-    # ── Device selection ──────────────────────────────────────
-    cuda_ok = torch.cuda.is_available()
-    print(f"\nDevice selection:")
+    # ── Device ────────────────────────────────────────────────
+    n_gpus  = torch.cuda.device_count()
+    print("\nDevice:")
     print("  0 → CPU")
-    if cuda_ok:
-        print(f"  1 → {torch.cuda.get_device_name(0)}  [default]")
-    default_dev = "1" if cuda_ok else "0"
+    for gi in range(n_gpus):
+        p       = torch.cuda.get_device_properties(gi)
+        default = "  [default]" if gi == 0 else ""
+        print(f"  {gi + 1} → GPU {gi}: {p.name}  ({p.total_memory // 1024**2} MB VRAM){default}")
+    default_dev   = "1" if n_gpus > 0 else "0"
     device_choice = input(f"Choice [{default_dev}]: ").strip() or default_dev
-    use_gpu = (device_choice == "1" and cuda_ok)
-    device  = torch.device("cuda" if use_gpu else "cpu")
+
+    gpu_idx = int(device_choice) - 1   # 0-based GPU index; -1 means CPU
+    use_gpu = (0 <= gpu_idx < n_gpus)
+    device  = torch.device(f"cuda:{gpu_idx}" if use_gpu else "cpu")
     if use_gpu:
-        props = torch.cuda.get_device_properties(0)
-        print(f"[INFO] GPU: {props.name}  VRAM: {props.total_memory // 1024**2} MB")
+        p = torch.cuda.get_device_properties(gpu_idx)
+        print(f"[INFO] GPU {gpu_idx}: {p.name}  ({p.total_memory // 1024**2} MB VRAM)")
     else:
         print("[INFO] Using CPU")
 
@@ -336,7 +332,6 @@ def main():
     print("  2 → Fixed FPS")
     print("  3 → Smart (skip near-duplicates)  [default]")
     mode = input("Choice [3]: ").strip() or "3"
-
     fps_extract = None
     skip_dupes  = False
     if mode == "2":
@@ -357,65 +352,67 @@ def main():
     start_idx  = detect_resume_index(out_dir, ext)
     eff_fps    = fps_extract or fps
     start_time = start_idx / eff_fps if eff_fps > 0 else 0.0
-
     if start_idx > 0:
         print(f"[INFO] Resuming from frame {start_idx} (t={start_time:.2f}s)")
 
-    # ── Tuning ────────────────────────────────────────────────
+    # ── Sizes & tuning ────────────────────────────────────────
     SCORE_W    = min(1280, W)
     SCORE_H    = max(1, int(H * SCORE_W / W))
-    batch_size = 64 if use_gpu else 16     # larger batches = better GPU utilisation
+    DUPE_W     = min(128, W)                   # 128px thumbnail for duplicate check
+    DUPE_H     = max(1, int(H * DUPE_W / W))  # ~100× fewer pixels than score res
+    batch_size = 64 if use_gpu else 16
     n_writers  = min(4, os.cpu_count() or 2)
 
     if top_n:
-        heap_ram_mb   = top_n * W * H * 3 / 1024**2
-        batch_ram_mb  = batch_size * W * H * 3 / 1024**2
-        print(f"\n[INFO] Heap RAM cap : ~{heap_ram_mb:.0f} MB  ({top_n} full frames)")
-        print(f"[INFO] Batch RAM    : ~{batch_ram_mb:.0f} MB  (batch of {batch_size})")
+        heap_mb  = top_n * W * H * 3 / 1024**2
+        batch_mb = batch_size * W * H * 3 / 1024**2
+        print(f"[INFO] Heap RAM cap : ~{heap_mb:.0f} MB  ({top_n} full frames)")
+        print(f"[INFO] Batch RAM    : ~{batch_mb:.0f} MB  ({batch_size} frames)")
 
     # ── Hardware decoder ──────────────────────────────────────
     hw_dec = detect_hardware_decoder(codec, use_gpu)
-    if hw_dec:
-        print(f"[INFO] Hardware decoder : {hw_dec}")
-    else:
-        print(f"[INFO] Software decoder (no hw accel found for {codec})")
+    print(f"[INFO] HW decoder   : {hw_dec or 'none (software)'}")
 
-    # ── Build FFmpeg command ───────────────────────────────────
+    # ── FFmpeg command ────────────────────────────────────────
     vf_chain = []
     if fps_extract:
         vf_chain.append(f"fps={fps_extract}")
     vf_chain.append("format=bgr24")
 
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
-           "-threads", "0"]                 # auto-thread demuxer/decoder
-
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-threads", "0"]
     if hw_dec:
         cmd += ["-hwaccel", "cuda", "-c:v", hw_dec]
-
     if start_time > 0:
         cmd += ["-ss", str(start_time)]
-
-    cmd += ["-i", video,
-            "-vf", ",".join(vf_chain),
+    cmd += ["-i", video, "-vf", ",".join(vf_chain),
             "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
 
-    # ── Pre-warm GPU (eliminates first-batch CUDA JIT delay) ──
+    # ── Pre-allocated batch buffer ────────────────────────────
+    # GPU: pinned torch tensor → single copy per frame + DMA to VRAM
+    # CPU: plain ndarray      → zero-copy torch.from_numpy in score_batch
     if use_gpu:
-        _dummy = np.zeros((1, SCORE_H, SCORE_W, 3), dtype=np.uint8)
+        torch.cuda.set_device(gpu_idx)   # bind all CUDA ops to the selected GPU
+        score_pin = torch.zeros((batch_size, SCORE_H, SCORE_W, 3),
+                                 dtype=torch.uint8).pin_memory()
+        score_np  = score_pin.numpy()   # CPU-side view for cv2 writes
+        # Pre-warm CUDA kernels with the actual buffer (eliminates first-batch JIT)
         _get_kernels(device, torch.float16)
-        score_batch([_dummy[0]], device)
-        torch.cuda.synchronize()
+        score_batch(score_pin, 1, device)
+        torch.cuda.synchronize(device)
         print("[INFO] CUDA kernels pre-warmed")
-
-    # ── CUDA stream for pipeline overlap ──────────────────────
-    cuda_stream = torch.cuda.Stream() if use_gpu else None
+        cuda_stream = torch.cuda.Stream(device=device)
+        buf_arg     = score_pin
+    else:
+        score_pin   = None
+        score_np    = np.empty((batch_size, SCORE_H, SCORE_W, 3), dtype=np.uint8)
+        cuda_stream = None
+        buf_arg     = score_np
 
     print(f"\n[INFO] Starting extraction...")
-    print(f"[INFO] Batch size   : {batch_size}")
-    print(f"[INFO] Score res    : {SCORE_W}×{SCORE_H}")
-    print(f"[INFO] Write threads: {n_writers}")
+    print(f"[INFO] Batch size   : {batch_size}  |  Score res  : {SCORE_W}×{SCORE_H}")
+    print(f"[INFO] Write threads: {n_writers}   |  Dupe res   : {DUPE_W}×{DUPE_H}")
     if top_n:
-        print(f"[INFO] Top-N mode   : {top_n} best frames")
+        print(f"[INFO] Top-N heap   : {top_n} frames")
 
     # ── Start FFmpeg pipe ─────────────────────────────────────
     pipe_process = subprocess.Popen(
@@ -426,18 +423,17 @@ def main():
     )
 
     frame_size = W * H * 3
-    raw_buf    = bytearray(frame_size)  # pre-allocated; no per-frame alloc
+    raw_buf    = bytearray(frame_size)   # pre-allocated; reused every frame
 
     # ── State ─────────────────────────────────────────────────
     heap        = TopNHeap(top_n) if top_n else None
-    frames_buf  = []      # downscaled frames for batch scoring
     indices_buf = []
-    full_buf    = []      # full-res frames (top_n mode only)
+    full_buf    = []     # full-res frames kept for top_n heap only
+    buf_len     = 0      # fill level of score_np / score_pin
 
     best_score  = float("-inf")
     best_file   = None
-
-    prev_small  = None
+    prev_tiny   = None
     idx         = start_idx
     n_processed = 0
     n_skipped   = 0
@@ -450,25 +446,20 @@ def main():
 
     # ── Flush scoring batch ───────────────────────────────────
     def flush_batch():
-        nonlocal best_score, best_file, n_processed
-        if not frames_buf:
+        nonlocal buf_len, best_score, best_file, n_processed
+        if buf_len == 0:
             return
-
-        scores = score_batch(frames_buf, device, cuda_stream)
-
+        scores = score_batch(buf_arg, buf_len, device, cuda_stream)
         for i, sc in enumerate(scores):
             fi = indices_buf[i]
             if top_n:
                 heap.offer(sc, fi, full_buf[i])
             else:
-                # Frame already written; update running best
                 fname = os.path.join(out_dir, f"frame_{fi:06d}{ext}")
                 if sc > best_score:
-                    best_score = sc
-                    best_file  = fname
+                    best_score, best_file = sc, fname
             n_processed += 1
-
-        frames_buf.clear()
+        buf_len = 0
         indices_buf.clear()
         if top_n:
             full_buf.clear()
@@ -479,34 +470,39 @@ def main():
             if not read_frame_exact(pipe_process.stdout, raw_buf, frame_size):
                 break
 
-            # np.frombuffer shares raw_buf; .copy() detaches before next read
-            frame_full  = np.frombuffer(raw_buf, dtype=np.uint8).reshape(H, W, 3).copy()
-            frame_small = cv2.resize(frame_full, (SCORE_W, SCORE_H), interpolation=cv2.INTER_AREA)
+            # .copy() detaches from raw_buf before the next readinto overwrites it
+            frame_full = np.frombuffer(raw_buf, dtype=np.uint8).reshape(H, W, 3).copy()
 
-            if skip_dupes and is_duplicate(frame_small, prev_small):
-                n_skipped += 1
-                idx += 1
-                pbar.update(1)
-                pbar.set_postfix(skip=n_skipped, keep=n_processed, refresh=False)
-                continue
-
-            prev_small = frame_small          # old ref freed; no explicit copy needed
+            if skip_dupes:
+                frame_tiny = cv2.resize(frame_full, (DUPE_W, DUPE_H),
+                                        interpolation=cv2.INTER_NEAREST)
+                if is_duplicate(frame_tiny, prev_tiny):
+                    n_skipped += 1
+                    idx += 1
+                    pbar.update(1)
+                    pbar.set_postfix(skip=n_skipped, keep=n_processed, refresh=False)
+                    continue
+                prev_tiny = frame_tiny   # old ref freed automatically
 
             if not top_n:
-                # Write immediately in background; score separately for best-tracking
                 fname = os.path.join(out_dir, f"frame_{idx:06d}{ext}")
                 pending_writes.append(
                     _write_executor.submit(cv2.imwrite, fname, frame_full, write_params)
                 )
 
-            frames_buf.append(frame_small)
+            # Resize and copy directly into the pre-allocated (pinned) buffer slot
+            cv2.resize(frame_full, (SCORE_W, SCORE_H),
+                       dst=score_np[buf_len],          # write directly into slot
+                       interpolation=cv2.INTER_AREA)
             indices_buf.append(idx)
+            buf_len += 1
+
             if top_n:
                 full_buf.append(frame_full)
 
-            if len(frames_buf) == batch_size:
+            if buf_len == batch_size:
                 flush_batch()
-                # Trim completed futures so list doesn't grow unbounded
+                # Trim finished write futures so the list stays bounded
                 if len(pending_writes) > n_writers * 4:
                     pending_writes[:] = [f for f in pending_writes if not f.done()]
 
@@ -515,52 +511,47 @@ def main():
             pbar.set_postfix(skip=n_skipped, keep=n_processed, refresh=False)
 
     except Exception as e:
-        print(f"\n[ERROR] Processing failed: {e}")
-        import traceback
+        print(f"\n[ERROR] {e}")
         traceback.print_exc()
         pipe_process.terminate()
         return
     finally:
         pbar.close()
 
-    flush_batch()       # remaining partial batch
+    flush_batch()
     pipe_process.wait()
 
     # ── Flush async write queue ───────────────────────────────
     if pending_writes:
         print("[INFO] Flushing write queue...")
-        failed = 0
-        for fut in pending_writes:
-            if not fut.result():
-                failed += 1
+        failed = sum(1 for f in pending_writes if not f.result())
         if failed:
             print(f"[WARN] {failed} frame(s) failed to write")
-
     _write_executor.shutdown(wait=True)
 
-    # ── Write top-N frames from heap ──────────────────────────
+    # ── Write top-N frames ────────────────────────────────────
     if top_n and heap:
         top_list = heap.sorted_top()
         print(f"\n[INFO] Writing top {len(top_list)} frames at full resolution...")
-        write_futures = []
         with ThreadPoolExecutor(max_workers=n_writers) as pool:
-            for sc, fi, frame in top_list:
-                fname = os.path.join(out_dir, f"frame_{fi:06d}{ext}")
-                write_futures.append((fname, sc, pool.submit(cv2.imwrite, fname, frame, write_params)))
-            written = sum(1 for _, _, f in write_futures if f.result())
-
+            futs = [
+                pool.submit(cv2.imwrite,
+                            os.path.join(out_dir, f"frame_{fi:06d}{ext}"),
+                            fr, write_params)
+                for _, fi, fr in top_list
+            ]
+            written = sum(1 for f in futs if f.result())
         print(f"[INFO] Wrote {written} frames")
-
         if top_list:
             best_score = top_list[0][0]
             best_file  = os.path.join(out_dir, f"frame_{top_list[0][1]:06d}{ext}")
 
     # ── Summary ───────────────────────────────────────────────
     saved = min(top_n, len(heap)) if (top_n and heap) else n_processed
-    print(f"\n{'=' * 56}")
+    print(f"\n{'=' * 58}")
     print("  EXTRACTION COMPLETE")
-    print(f"{'─' * 56}")
-    print(f"  Frames processed : {n_processed}")
+    print(f"{'─' * 58}")
+    print(f"  Frames processed  : {n_processed}")
     if skip_dupes:
         print(f"  Duplicates skipped: {n_skipped}")
     print(f"  Frames saved      : {saved}")
@@ -568,7 +559,7 @@ def main():
         print(f"  Best frame        : {os.path.basename(best_file)}")
         print(f"  Best score        : {best_score:.6f}")
     print(f"  Output directory  : {out_dir}")
-    print(f"{'=' * 56}\n")
+    print(f"{'=' * 58}\n")
 
 
 if __name__ == "__main__":
