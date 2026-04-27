@@ -115,27 +115,101 @@ def ffprobe(video):
     return codec, W, H, fps, duration, pix_fmt
 
 
-# ── Hardware decoder (probed once) ────────────────────────────────────────────
-def detect_hardware_decoder(codec, use_gpu):
+# ── GPU enumeration (torch.cuda primary, nvidia-smi fallback) ────────────────
+def enumerate_gpus():
+    """
+    Return a list of dicts describing available GPUs.
+    Tries torch.cuda first; falls back to nvidia-smi so eGPUs and GPUs with
+    mismatched CUDA drivers still appear in the menu with a useful warning.
+    """
+    gpus = []
+
+    # Primary: torch.cuda (guaranteed to work for scoring)
+    n = torch.cuda.device_count()
+    for i in range(n):
+        p = torch.cuda.get_device_properties(i)
+        gpus.append(dict(
+            label    = f"GPU {i}: {p.name}  ({p.total_memory // 1024**2} MB VRAM)",
+            cuda_idx = i,
+            cuda_ok  = True,
+        ))
+
+    # Fallback: nvidia-smi — catches eGPUs / drivers not yet linked to PyTorch CUDA
+    if not gpus:
+        try:
+            r = subprocess.run(
+                ["nvidia-smi",
+                 "--query-gpu=index,name,memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                for line in r.stdout.strip().splitlines():
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) >= 3:
+                        vram = int(parts[2]) if parts[2].isdigit() else 0
+                        gpus.append(dict(
+                            label    = f"GPU {parts[0]}: {parts[1]}  ({vram} MB VRAM)"
+                                       "  ⚠ CUDA unavailable in PyTorch",
+                            cuda_idx = None,
+                            cuda_ok  = False,
+                        ))
+        except Exception:
+            pass
+
+    return gpus
+
+
+# ── Hardware decoder (probed once, GPU-capability aware) ─────────────────────
+# NVIDIA NVDEC capability matrix (compute capability → codec support):
+#   5.x Maxwell  : H.264, HEVC, VP9
+#   6.x Pascal   : + HEVC 10-bit
+#   7.x Turing   : (1660 Ti = 7.5)  H.264, HEVC, VP9   — NO AV1
+#   8.6+ Ampere  : + AV1
+#   8.9 Ada      : + AV1 (faster)
+def detect_hardware_decoder(codec, use_gpu, gpu_idx=0):
     if not use_gpu:
-        return None
+        return None, None
+
+    # Check actual GPU capability before trusting the FFmpeg decoder list
+    skip_reason = None
+    if torch.cuda.is_available():
+        cap = torch.cuda.get_device_capability(gpu_idx)
+        if codec == "av1" and cap < (8, 6):
+            name = torch.cuda.get_device_name(gpu_idx)
+            skip_reason = (f"{name} (compute {cap[0]}.{cap[1]}) has no AV1 NVDEC. "
+                           f"AV1 hardware decode needs Ampere (RTX 30xx) or newer.")
+            return None, skip_reason
+
     candidates = {
         "h264": ["h264_cuvid", "h264_qsv"],
         "hevc": ["hevc_cuvid", "hevc_qsv"],
         "vp9":  ["vp9_cuvid",  "vp9_qsv"],
         "av1":  ["av1_cuvid",  "av1_qsv"],
     }.get(codec, [])
+
     if not candidates:
-        return None
+        return None, None
+
     try:
         r = subprocess.run(["ffmpeg", "-hide_banner", "-decoders"],
                            capture_output=True, text=True, timeout=5)
         for dec in candidates:
             if dec in r.stdout:
-                return dec
+                return dec, None
     except Exception:
         pass
-    return None
+    return None, None
+
+
+def has_libdav1d():
+    """libdav1d is a much faster AV1 software decoder than libaom-av1."""
+    try:
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-decoders"],
+                           capture_output=True, text=True, timeout=5)
+        return "libdav1d" in r.stdout
+    except Exception:
+        return False
 
 
 # ── Resume detection ──────────────────────────────────────────────────────────
@@ -307,24 +381,42 @@ def main():
     print(f"{'─' * 58}")
 
     # ── Device ────────────────────────────────────────────────
-    n_gpus  = torch.cuda.device_count()
+    gpus = enumerate_gpus()
     print("\nDevice:")
     print("  0 → CPU")
-    for gi in range(n_gpus):
-        p       = torch.cuda.get_device_properties(gi)
-        default = "  [default]" if gi == 0 else ""
-        print(f"  {gi + 1} → GPU {gi}: {p.name}  ({p.total_memory // 1024**2} MB VRAM){default}")
-    default_dev   = "1" if n_gpus > 0 else "0"
+    for i, g in enumerate(gpus):
+        tag = "  [default]" if i == 0 and g["cuda_ok"] else ""
+        print(f"  {i + 1} → {g['label']}{tag}")
+
+    has_cuda = any(g["cuda_ok"] for g in gpus)
+    default_dev   = "1" if has_cuda else "0"
     device_choice = input(f"Choice [{default_dev}]: ").strip() or default_dev
 
-    gpu_idx = int(device_choice) - 1   # 0-based GPU index; -1 means CPU
-    use_gpu = (0 <= gpu_idx < n_gpus)
-    device  = torch.device(f"cuda:{gpu_idx}" if use_gpu else "cpu")
-    if use_gpu:
-        p = torch.cuda.get_device_properties(gpu_idx)
-        print(f"[INFO] GPU {gpu_idx}: {p.name}  ({p.total_memory // 1024**2} MB VRAM)")
-    else:
+    try:
+        choice_i = int(device_choice)
+    except ValueError:
+        choice_i = 0
+
+    if choice_i == 0 or not gpus or choice_i > len(gpus):
+        use_gpu = False
+        gpu_idx = -1
+        device  = torch.device("cpu")
         print("[INFO] Using CPU")
+    else:
+        g = gpus[choice_i - 1]
+        if g["cuda_ok"]:
+            gpu_idx = g["cuda_idx"]
+            use_gpu = True
+            device  = torch.device(f"cuda:{gpu_idx}")
+            p       = torch.cuda.get_device_properties(gpu_idx)
+            print(f"[INFO] GPU {gpu_idx}: {p.name}  ({p.total_memory // 1024**2} MB VRAM)")
+        else:
+            print(f"[WARN] That GPU is visible but CUDA is not available in your PyTorch.")
+            print(f"[WARN] Fix: pip install torch --index-url https://download.pytorch.org/whl/cu121")
+            print(f"[INFO] Falling back to CPU.")
+            use_gpu = False
+            gpu_idx = -1
+            device  = torch.device("cpu")
 
     # ── Extraction mode ───────────────────────────────────────
     print("\nExtraction mode:")
@@ -363,25 +455,55 @@ def main():
     batch_size = 64 if use_gpu else 16
     n_writers  = min(4, os.cpu_count() or 2)
 
+    # ── Two-pass strategy decision ────────────────────────────
+    # When top_n is set AND source resolution > score resolution, ask FFmpeg
+    # to pre-scale on its side (multi-threaded). Pipe data drops e.g. 9× for
+    # 4K→720p, eliminating the per-frame Python cv2.resize on full frames and
+    # the multi-GB full-res heap. Top-N frames are re-extracted at full res
+    # at the end via a single FFmpeg select-filter pass.
+    use_two_pass = bool(top_n) and (W > SCORE_W or H > SCORE_H)
+    PIPE_W, PIPE_H = (SCORE_W, SCORE_H) if use_two_pass else (W, H)
+
     if top_n:
-        heap_mb  = top_n * W * H * 3 / 1024**2
-        batch_mb = batch_size * W * H * 3 / 1024**2
-        print(f"[INFO] Heap RAM cap : ~{heap_mb:.0f} MB  ({top_n} full frames)")
+        if use_two_pass:
+            heap_mb  = top_n * 0.001     # heap stores (score, idx) only — no frame data
+            batch_mb = batch_size * SCORE_W * SCORE_H * 3 / 1024**2
+            print(f"[INFO] Two-pass mode: pipe @ {PIPE_W}×{PIPE_H} (FFmpeg-side scale)")
+            print(f"[INFO] Pipe data    : ~{(W*H*3)/(SCORE_W*SCORE_H*3):.0f}× smaller "
+                  f"({W*H*3/1024**2:.0f} → {SCORE_W*SCORE_H*3/1024**2:.1f} MB/frame)")
+        else:
+            heap_mb  = top_n * W * H * 3 / 1024**2
+            batch_mb = batch_size * W * H * 3 / 1024**2
+        print(f"[INFO] Heap RAM cap : ~{heap_mb:.0f} MB")
         print(f"[INFO] Batch RAM    : ~{batch_mb:.0f} MB  ({batch_size} frames)")
 
     # ── Hardware decoder ──────────────────────────────────────
-    hw_dec = detect_hardware_decoder(codec, use_gpu)
+    hw_dec, hw_skip = detect_hardware_decoder(codec, use_gpu, max(0, gpu_idx))
+    if hw_skip:
+        print(f"[WARN] {hw_skip}")
     print(f"[INFO] HW decoder   : {hw_dec or 'none (software)'}")
+
+    # ── Software-decoder optimization: prefer libdav1d for AV1 ────
+    sw_codec_override = None
+    if not hw_dec and codec == "av1" and has_libdav1d():
+        sw_codec_override = "libdav1d"
+        print(f"[INFO] SW decoder   : libdav1d  (2–3× faster than libaom-av1)")
 
     # ── FFmpeg command ────────────────────────────────────────
     vf_chain = []
     if fps_extract:
         vf_chain.append(f"fps={fps_extract}")
+    if (PIPE_W, PIPE_H) != (W, H):
+        # FFmpeg's scale filter is internally multi-threaded — much faster than
+        # cv2.resize on a full-res 4K frame in our Python loop.
+        vf_chain.append(f"scale={PIPE_W}:{PIPE_H}:flags=area")
     vf_chain.append("format=bgr24")
 
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-threads", "0"]
     if hw_dec:
         cmd += ["-hwaccel", "cuda", "-c:v", hw_dec]
+    elif sw_codec_override:
+        cmd += ["-c:v", sw_codec_override]
     if start_time > 0:
         cmd += ["-ss", str(start_time)]
     cmd += ["-i", video, "-vf", ",".join(vf_chain),
@@ -422,8 +544,9 @@ def main():
         bufsize=10 ** 8,
     )
 
-    frame_size = W * H * 3
-    raw_buf    = bytearray(frame_size)   # pre-allocated; reused every frame
+    frame_size = PIPE_W * PIPE_H * 3        # bytes per piped frame (post-scale)
+    raw_buf    = bytearray(frame_size)      # pre-allocated; reused every frame
+    pipe_at_score_res = (PIPE_W == SCORE_W and PIPE_H == SCORE_H)
 
     # ── State ─────────────────────────────────────────────────
     heap        = TopNHeap(top_n) if top_n else None
@@ -453,7 +576,9 @@ def main():
         for i, sc in enumerate(scores):
             fi = indices_buf[i]
             if top_n:
-                heap.offer(sc, fi, full_buf[i])
+                # Two-pass: store metadata only (None) — frame is re-extracted later.
+                # One-pass: store the full-res frame from full_buf.
+                heap.offer(sc, fi, None if use_two_pass else full_buf[i])
             else:
                 fname = os.path.join(out_dir, f"frame_{fi:06d}{ext}")
                 if sc > best_score:
@@ -461,7 +586,7 @@ def main():
             n_processed += 1
         buf_len = 0
         indices_buf.clear()
-        if top_n:
+        if top_n and not use_two_pass:
             full_buf.clear()
 
     # ── Extraction loop ───────────────────────────────────────
@@ -470,39 +595,52 @@ def main():
             if not read_frame_exact(pipe_process.stdout, raw_buf, frame_size):
                 break
 
-            # .copy() detaches from raw_buf before the next readinto overwrites it
-            frame_full = np.frombuffer(raw_buf, dtype=np.uint8).reshape(H, W, 3).copy()
+            # frame_pipe is at PIPE resolution (= SCORE res in two-pass mode,
+            # = source res otherwise). .copy() detaches from raw_buf before the
+            # next readinto overwrites it.
+            frame_pipe = np.frombuffer(raw_buf, dtype=np.uint8).reshape(PIPE_H, PIPE_W, 3).copy()
 
             if skip_dupes:
-                frame_tiny = cv2.resize(frame_full, (DUPE_W, DUPE_H),
-                                        interpolation=cv2.INTER_NEAREST)
+                # Reuse frame_pipe directly if already small enough
+                if PIPE_W <= DUPE_W * 2:
+                    frame_tiny = frame_pipe
+                else:
+                    frame_tiny = cv2.resize(frame_pipe, (DUPE_W, DUPE_H),
+                                            interpolation=cv2.INTER_NEAREST)
                 if is_duplicate(frame_tiny, prev_tiny):
                     n_skipped += 1
                     idx += 1
                     pbar.update(1)
                     pbar.set_postfix(skip=n_skipped, keep=n_processed, refresh=False)
                     continue
-                prev_tiny = frame_tiny   # old ref freed automatically
+                prev_tiny = frame_tiny
 
             if not top_n:
+                # All-frames mode: pipe is at full res, save as-is
                 fname = os.path.join(out_dir, f"frame_{idx:06d}{ext}")
                 pending_writes.append(
-                    _write_executor.submit(cv2.imwrite, fname, frame_full, write_params)
+                    _write_executor.submit(cv2.imwrite, fname, frame_pipe, write_params)
                 )
 
-            # Resize and copy directly into the pre-allocated (pinned) buffer slot
-            cv2.resize(frame_full, (SCORE_W, SCORE_H),
-                       dst=score_np[buf_len],          # write directly into slot
-                       interpolation=cv2.INTER_AREA)
+            # Fill the pre-allocated (pinned) scoring buffer slot
+            if pipe_at_score_res:
+                # Already at score resolution — direct memcpy into pinned slot
+                np.copyto(score_np[buf_len], frame_pipe)
+            else:
+                # Resize on CPU into the pinned slot (small overhead vs 4K cv2.resize)
+                cv2.resize(frame_pipe, (SCORE_W, SCORE_H),
+                           dst=score_np[buf_len],
+                           interpolation=cv2.INTER_AREA)
             indices_buf.append(idx)
             buf_len += 1
 
-            if top_n:
-                full_buf.append(frame_full)
+            # Only buffer full-res frames when we have them AND need them for
+            # the heap (i.e., source already ≤ score res, no two-pass needed)
+            if top_n and not use_two_pass:
+                full_buf.append(frame_pipe)
 
             if buf_len == batch_size:
                 flush_batch()
-                # Trim finished write futures so the list stays bounded
                 if len(pending_writes) > n_writers * 4:
                     pending_writes[:] = [f for f in pending_writes if not f.done()]
 
@@ -532,15 +670,58 @@ def main():
     # ── Write top-N frames ────────────────────────────────────
     if top_n and heap:
         top_list = heap.sorted_top()
-        print(f"\n[INFO] Writing top {len(top_list)} frames at full resolution...")
-        with ThreadPoolExecutor(max_workers=n_writers) as pool:
-            futs = [
-                pool.submit(cv2.imwrite,
-                            os.path.join(out_dir, f"frame_{fi:06d}{ext}"),
-                            fr, write_params)
-                for _, fi, fr in top_list
+
+        if use_two_pass:
+            # Single-pass select-filter extraction at full source resolution.
+            # FFmpeg decodes once and emits only the requested frames, in order.
+            indices_sorted = sorted({fi for _, fi, _ in top_list})
+            print(f"\n[INFO] Pass 2: extracting top {len(indices_sorted)} frames "
+                  f"at {W}×{H} via FFmpeg select filter...")
+
+            # Build select expression: eq(n,X)+eq(n,Y)+...  (commas escaped for filter syntax)
+            select_expr = "+".join(f"eq(n\\,{i})" for i in indices_sorted)
+
+            tmp_pattern = os.path.join(out_dir, f"_tmp_%06d{ext}")
+            extract_cmd = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "0",
             ]
-            written = sum(1 for f in futs if f.result())
+            if hw_dec:
+                extract_cmd += ["-hwaccel", "cuda", "-c:v", hw_dec]
+            elif sw_codec_override:
+                extract_cmd += ["-c:v", sw_codec_override]
+            extract_cmd += [
+                "-i", video,
+                "-vf", f"select='{select_expr}'",
+                "-vsync", "vfr",
+                "-start_number", "0",
+                "-y", tmp_pattern,
+            ]
+            r = subprocess.run(extract_cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                print(f"[ERROR] Pass-2 extraction failed: {r.stderr}")
+                written = 0
+            else:
+                # FFmpeg emits frames in source-order matching indices_sorted
+                written = 0
+                for i, fi in enumerate(indices_sorted):
+                    src = os.path.join(out_dir, f"_tmp_{i:06d}{ext}")
+                    dst = os.path.join(out_dir, f"frame_{fi:06d}{ext}")
+                    if os.path.exists(src):
+                        if os.path.exists(dst):
+                            os.remove(dst)
+                        os.rename(src, dst)
+                        written += 1
+        else:
+            print(f"\n[INFO] Writing top {len(top_list)} frames at full resolution...")
+            with ThreadPoolExecutor(max_workers=n_writers) as pool:
+                futs = [
+                    pool.submit(cv2.imwrite,
+                                os.path.join(out_dir, f"frame_{fi:06d}{ext}"),
+                                fr, write_params)
+                    for _, fi, fr in top_list
+                ]
+                written = sum(1 for f in futs if f.result())
+
         print(f"[INFO] Wrote {written} frames")
         if top_list:
             best_score = top_list[0][0]
