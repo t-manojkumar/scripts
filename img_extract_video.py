@@ -121,75 +121,126 @@ def enumerate_gpus():
     Return a list of dicts describing available GPUs.
     Tries torch.cuda first; falls back to nvidia-smi so eGPUs and GPUs with
     mismatched CUDA drivers still appear in the menu with a useful warning.
+    Each entry also carries compute_cap so NVDEC capability checks work even
+    when PyTorch is CPU-only.
     """
     gpus = []
 
-    # Primary: torch.cuda (guaranteed to work for scoring)
+    # Primary: torch.cuda (guaranteed to work for both NVDEC and scoring)
     n = torch.cuda.device_count()
     for i in range(n):
-        p = torch.cuda.get_device_properties(i)
+        p   = torch.cuda.get_device_properties(i)
+        cap = torch.cuda.get_device_capability(i)
         gpus.append(dict(
-            label    = f"GPU {i}: {p.name}  ({p.total_memory // 1024**2} MB VRAM)",
-            cuda_idx = i,
-            cuda_ok  = True,
+            label       = f"GPU {i}: {p.name}  ({p.total_memory // 1024**2} MB VRAM)",
+            name        = p.name,
+            cuda_idx    = i,
+            cuda_ok     = True,
+            compute_cap = cap,
         ))
 
-    # Fallback: nvidia-smi — catches eGPUs / drivers not yet linked to PyTorch CUDA
+    # Fallback: nvidia-smi — catches GPUs visible to the driver but not to PyTorch.
+    # NVDEC / scale_cuda / hwupload_cuda still work via FFmpeg in this mode.
     if not gpus:
         try:
             r = subprocess.run(
                 ["nvidia-smi",
-                 "--query-gpu=index,name,memory.total",
+                 "--query-gpu=index,name,memory.total,compute_cap",
                  "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=5,
             )
             if r.returncode == 0:
                 for line in r.stdout.strip().splitlines():
                     parts = [p.strip() for p in line.split(",")]
-                    if len(parts) >= 3:
-                        vram = int(parts[2]) if parts[2].isdigit() else 0
-                        gpus.append(dict(
-                            label    = f"GPU {parts[0]}: {parts[1]}  ({vram} MB VRAM)"
-                                       "  ⚠ CUDA unavailable in PyTorch",
-                            cuda_idx = None,
-                            cuda_ok  = False,
-                        ))
+                    if len(parts) < 3:
+                        continue
+                    vram = int(parts[2]) if parts[2].isdigit() else 0
+                    cap  = None
+                    if len(parts) >= 4 and "." in parts[3]:
+                        try:
+                            cap = tuple(int(x) for x in parts[3].split("."))
+                        except ValueError:
+                            cap = None
+                    if cap is None:
+                        cap = _infer_compute_cap_from_name(parts[1])
+                    gpus.append(dict(
+                        label       = f"GPU {parts[0]}: {parts[1]}  ({vram} MB VRAM)"
+                                       "  ⚠ PyTorch CUDA missing — FFmpeg NVDEC still usable",
+                        name        = parts[1],
+                        cuda_idx    = None,
+                        cuda_ok     = False,
+                        compute_cap = cap,
+                    ))
         except Exception:
             pass
 
     return gpus
 
 
-# ── Hardware decoder (probed once, GPU-capability aware) ─────────────────────
-# NVIDIA NVDEC capability matrix (compute capability → codec support):
-#   5.x Maxwell  : H.264, HEVC, VP9
-#   6.x Pascal   : + HEVC 10-bit
-#   7.x Turing   : (1660 Ti = 7.5)  H.264, HEVC, VP9   — NO AV1
-#   8.6+ Ampere  : + AV1
-#   8.9 Ada      : + AV1 (faster)
-def detect_hardware_decoder(codec, use_gpu, gpu_idx=0):
-    if not use_gpu:
+def _infer_compute_cap_from_name(name):
+    """Best-effort compute-capability guess from GPU model name (driver < 515)."""
+    n = name.lower()
+    if "rtx 50" in n or "rtx 40" in n or "ada" in n or "h100" in n or "h200" in n:
+        return (8, 9)
+    if "rtx 30" in n or "a100" in n or "a40" in n or "a10" in n or "ampere" in n:
+        return (8, 6)
+    if "rtx 20" in n or "gtx 16" in n or "titan rtx" in n or "turing" in n:
+        return (7, 5)
+    if "v100" in n or "titan v" in n or "volta" in n:
+        return (7, 0)
+    if "gtx 10" in n or "titan x" in n or "p100" in n or "p40" in n or "pascal" in n:
+        return (6, 1)
+    if "gtx 9" in n or "maxwell" in n or "m40" in n or "m60" in n:
+        return (5, 2)
+    return (5, 0)   # conservative default — base NVDEC (H.264) only
+
+
+# ── Hardware decoder — capability-aware, PyTorch-independent ─────────────────
+# NVIDIA NVDEC capability matrix:
+#   5.0  Maxwell-1: H.264
+#   5.2  Maxwell-2: + HEVC 8-bit
+#   6.0+ Pascal   : + HEVC 10-bit, VP9
+#   7.0+ Volta    : (refinements)
+#   7.5  Turing   : (1660 Ti, RTX 20xx)  H.264, HEVC, VP9   — NO AV1
+#   8.6+ Ampere   : + AV1
+#   8.9  Ada      : + AV1 (faster)
+def detect_hardware_decoder(codec, gpu_info):
+    """
+    gpu_info : dict from enumerate_gpus()  OR  None (no NVIDIA GPU).
+    Works whether or not PyTorch CUDA is available — only requires the driver.
+    Returns (decoder_name | None, skip_reason | None).
+    """
+    if not gpu_info:
         return None, None
 
-    # Check actual GPU capability before trusting the FFmpeg decoder list
-    skip_reason = None
-    if torch.cuda.is_available():
-        cap = torch.cuda.get_device_capability(gpu_idx)
-        if codec == "av1" and cap < (8, 6):
-            name = torch.cuda.get_device_name(gpu_idx)
-            skip_reason = (f"{name} (compute {cap[0]}.{cap[1]}) has no AV1 NVDEC. "
-                           f"AV1 hardware decode needs Ampere (RTX 30xx) or newer.")
-            return None, skip_reason
+    cap   = gpu_info.get("compute_cap") or (5, 0)
+    name  = gpu_info.get("name", "GPU")
 
+    # Per-codec NVDEC capability check
+    min_cap = {
+        "h264": (5, 0),
+        "hevc": (5, 2),
+        "vp9":  (6, 0),
+        "av1":  (8, 6),
+    }.get(codec)
+
+    if min_cap is None:
+        return None, None     # codec not in NVDEC table
+
+    if cap < min_cap:
+        gen_name = {(8, 6): "Ampere (RTX 30xx)",
+                    (6, 0): "Pascal (GTX 10xx)",
+                    (5, 2): "Maxwell 2 (GTX 9xx)"}.get(min_cap, f"compute {min_cap[0]}.{min_cap[1]}")
+        return None, (f"{name} (compute {cap[0]}.{cap[1]}) cannot {codec.upper()} NVDEC. "
+                      f"Needs {gen_name} or newer.")
+
+    # Verify FFmpeg has the decoder compiled
     candidates = {
         "h264": ["h264_cuvid", "h264_qsv"],
         "hevc": ["hevc_cuvid", "hevc_qsv"],
         "vp9":  ["vp9_cuvid",  "vp9_qsv"],
         "av1":  ["av1_cuvid",  "av1_qsv"],
     }.get(codec, [])
-
-    if not candidates:
-        return None, None
 
     try:
         r = subprocess.run(["ffmpeg", "-hide_banner", "-decoders"],
@@ -200,6 +251,16 @@ def detect_hardware_decoder(codec, use_gpu, gpu_idx=0):
     except Exception:
         pass
     return None, None
+
+
+def has_ffmpeg_filter(name):
+    """Check whether FFmpeg has a given filter compiled in (e.g. 'scale_cuda')."""
+    try:
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-filters"],
+                           capture_output=True, text=True, timeout=5)
+        return name in r.stdout
+    except Exception:
+        return False
 
 
 def has_libdav1d():
@@ -397,23 +458,34 @@ def main():
     except ValueError:
         choice_i = 0
 
+    # nvidia_gpu = the selected NVIDIA GPU dict (used for FFmpeg NVDEC/scale_cuda
+    #              even when PyTorch CUDA is unavailable).
+    # use_gpu    = True only when PyTorch can actually run scoring on CUDA.
+    nvidia_gpu = None
     if choice_i == 0 or not gpus or choice_i > len(gpus):
         use_gpu = False
         gpu_idx = -1
         device  = torch.device("cpu")
-        print("[INFO] Using CPU")
+        print("[INFO] PyTorch scoring : CPU")
     else:
-        g = gpus[choice_i - 1]
+        g          = gpus[choice_i - 1]
+        nvidia_gpu = g           # FFmpeg can still use this GPU regardless of PyTorch
         if g["cuda_ok"]:
             gpu_idx = g["cuda_idx"]
             use_gpu = True
             device  = torch.device(f"cuda:{gpu_idx}")
             p       = torch.cuda.get_device_properties(gpu_idx)
-            print(f"[INFO] GPU {gpu_idx}: {p.name}  ({p.total_memory // 1024**2} MB VRAM)")
+            print(f"[INFO] PyTorch scoring : GPU {gpu_idx}  ({p.name}, "
+                  f"{p.total_memory // 1024**2} MB VRAM)")
         else:
-            print(f"[WARN] That GPU is visible but CUDA is not available in your PyTorch.")
-            print(f"[WARN] Fix: pip install torch --index-url https://download.pytorch.org/whl/cu121")
-            print(f"[INFO] Falling back to CPU.")
+            # PyTorch is CPU-only, but NVDEC + scale_cuda will still run on the GPU.
+            print(f"\n[WARN] PyTorch can't see CUDA on this install (running on CPU).")
+            print(f"[WARN]   Installed torch version : {torch.__version__}")
+            print(f"[WARN]   To enable GPU scoring, in this Python:")
+            print(f"[WARN]     pip uninstall torch torchvision -y")
+            print(f"[WARN]     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121")
+            print(f"[INFO] Continuing — FFmpeg will still use {g['name']} for "
+                  f"NVDEC + GPU scaling where possible.")
             use_gpu = False
             gpu_idx = -1
             device  = torch.device("cpu")
@@ -477,35 +549,62 @@ def main():
         print(f"[INFO] Heap RAM cap : ~{heap_mb:.0f} MB")
         print(f"[INFO] Batch RAM    : ~{batch_mb:.0f} MB  ({batch_size} frames)")
 
-    # ── Hardware decoder ──────────────────────────────────────
-    hw_dec, hw_skip = detect_hardware_decoder(codec, use_gpu, max(0, gpu_idx))
+    # ── Hardware decoder (PyTorch-independent) ────────────────
+    # NVDEC works whenever the driver and codec/capability allow it,
+    # regardless of whether PyTorch can use CUDA.
+    hw_dec, hw_skip = detect_hardware_decoder(codec, nvidia_gpu)
     if hw_skip:
         print(f"[WARN] {hw_skip}")
-    print(f"[INFO] HW decoder   : {hw_dec or 'none (software)'}")
 
-    # ── Software-decoder optimization: prefer libdav1d for AV1 ────
+    # GPU-side scaling: scale_cuda lets FFmpeg keep frames in VRAM end-to-end
+    # (NVDEC → scale_cuda → hwdownload → bgr24). Avoids both CPU scaling and
+    # the per-frame Python cv2.resize.
+    use_scale_cuda = bool(hw_dec) and has_ffmpeg_filter("scale_cuda")
+
+    # Software-decoder optimization: prefer libdav1d for AV1 (2–3× libaom-av1)
     sw_codec_override = None
     if not hw_dec and codec == "av1" and has_libdav1d():
         sw_codec_override = "libdav1d"
-        print(f"[INFO] SW decoder   : libdav1d  (2–3× faster than libaom-av1)")
+
+    # Status banner
+    if hw_dec:
+        chain = f"NVDEC ({hw_dec})"
+        if use_scale_cuda and (PIPE_W, PIPE_H) != (W, H):
+            chain += " → scale_cuda → hwdownload"
+        print(f"[INFO] Decode chain : {chain}  (GPU)")
+    else:
+        decoder_label = sw_codec_override or "default"
+        print(f"[INFO] Decode chain : {decoder_label}  (CPU — NVDEC unavailable for this codec/GPU)")
 
     # ── FFmpeg command ────────────────────────────────────────
     vf_chain = []
     if fps_extract:
         vf_chain.append(f"fps={fps_extract}")
-    if (PIPE_W, PIPE_H) != (W, H):
-        # FFmpeg's scale filter is internally multi-threaded — much faster than
-        # cv2.resize on a full-res 4K frame in our Python loop.
-        vf_chain.append(f"scale={PIPE_W}:{PIPE_H}:flags=area")
-    vf_chain.append("format=bgr24")
+
+    if use_scale_cuda:
+        # NVDEC outputs CUDA frames; scale on GPU, then hwdownload to CPU.
+        if (PIPE_W, PIPE_H) != (W, H):
+            vf_chain.append(f"scale_cuda={PIPE_W}:{PIPE_H}")
+        vf_chain.append("hwdownload")
+        vf_chain.append("format=bgr24")
+    else:
+        # CPU scale (still multi-threaded inside FFmpeg via libswscale).
+        if (PIPE_W, PIPE_H) != (W, H):
+            vf_chain.append(f"scale={PIPE_W}:{PIPE_H}:flags=area")
+        vf_chain.append("format=bgr24")
 
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-threads", "0"]
     if hw_dec:
-        cmd += ["-hwaccel", "cuda", "-c:v", hw_dec]
+        cmd += ["-hwaccel", "cuda"]
+        if use_scale_cuda:
+            cmd += ["-hwaccel_output_format", "cuda"]   # keep NVDEC frames in VRAM
+        cmd += ["-c:v", hw_dec]
     elif sw_codec_override:
         cmd += ["-c:v", sw_codec_override]
+
     if start_time > 0:
         cmd += ["-ss", str(start_time)]
+
     cmd += ["-i", video, "-vf", ",".join(vf_chain),
             "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
 
