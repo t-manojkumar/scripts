@@ -1,24 +1,65 @@
 import csv
 import os
 
-def load_usernames(file_path):
-    usernames = set()
+USERNAME_COLUMNS = ("username", "user_name", "userName", "UserName")
+ID_COLUMNS = ("id", "user_id", "userId", "pk")
+
+
+def normalize_header(value):
+    return "".join(ch for ch in value.strip().lower() if ch.isalnum())
+
+
+def find_column(header, candidates):
+    normalized_header = [normalize_header(column) for column in header]
+    normalized_candidates = {normalize_header(candidate) for candidate in candidates}
+
+    for index, column in enumerate(normalized_header):
+        if column in normalized_candidates:
+            return index
+
+    return None
+
+
+def load_users(file_path):
+    users = {}
 
     with open(file_path, newline='', encoding="utf-8") as f:
         reader = csv.reader(f)
-        header = next(reader)
+        header = next(reader, None)
+        if not header:
+            return users
 
-        # Try to find "username" column, else use first column
-        try:
-            username_index = header.index("username")
-        except ValueError:
-            username_index = 0
+        username_index = find_column(header, USERNAME_COLUMNS)
+        id_index = find_column(header, ID_COLUMNS)
+
+        if username_index is None and id_index is None:
+            raise ValueError(
+                f"No username/userName or id column found in {file_path}. "
+                f"Available columns: {', '.join(header)}"
+            )
 
         for row in reader:
-            if row and len(row) > username_index:
-                usernames.add(row[username_index].strip().lower())
+            if not row:
+                continue
 
-    return usernames
+            username = ""
+            user_id = ""
+
+            if username_index is not None and len(row) > username_index:
+                username = row[username_index].strip()
+
+            if id_index is not None and len(row) > id_index:
+                user_id = row[id_index].strip()
+
+            if not username and not user_id:
+                continue
+
+            # Match by stable Instagram id when available, but display username.
+            key = (user_id or username).lower()
+            display_name = username or user_id
+            users[key] = display_name
+
+    return users
 
 
 # ---------- USER INPUT ----------
@@ -35,10 +76,10 @@ if not os.path.isfile(followers_file):
 
 
 # ---------- LOAD DATA ----------
-following = load_usernames(following_file)
-followers = load_usernames(followers_file)
+following = load_users(following_file)
+followers = load_users(followers_file)
 
-all_users = sorted(following | followers)
+all_users = sorted(set(following) | set(followers))
 
 
 # ---------- PREPARE OUTPUT ----------
@@ -47,6 +88,7 @@ rows = []
 for user in all_users:
     i_follow = "Yes" if user in following else "No"
     follows_me = "Yes" if user in followers else "No"
+    username = following.get(user) or followers.get(user)
 
     if i_follow == "Yes" and follows_me == "Yes":
         status = "Mutual"
@@ -57,7 +99,7 @@ for user in all_users:
     else:
         status = "No Relationship"
 
-    rows.append([user, i_follow, follows_me, status])
+    rows.append([username, i_follow, follows_me, status])
 
 
 # ---------- TERMINAL TABLE ----------
