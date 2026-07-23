@@ -2,3 +2,4 @@
 /build
 /.idea
 /.claude
+/__pycache__

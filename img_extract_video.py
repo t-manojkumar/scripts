@@ -273,6 +273,17 @@ def has_libdav1d():
         return False
 
 
+def get_hwdownload_format(src_pix_fmt):
+    """
+    Pick a software pixel format that `hwdownload` can output for CUDA frames.
+    FFmpeg cannot download CUDA frames straight into packed BGR formats.
+    """
+    pf = (src_pix_fmt or "").lower()
+    if "p010" in pf or "10" in pf:
+        return "p010le"
+    return "nv12"
+
+
 # ── Resume detection ──────────────────────────────────────────────────────────
 def detect_resume_index(out_dir, ext):
     pattern = re.compile(rf"frame_(\d+){re.escape(ext)}$")
@@ -583,9 +594,11 @@ def main():
 
     if use_scale_cuda:
         # NVDEC outputs CUDA frames; scale on GPU, then hwdownload to CPU.
+        hwdownload_fmt = get_hwdownload_format(pix_fmt)
         if (PIPE_W, PIPE_H) != (W, H):
             vf_chain.append(f"scale_cuda={PIPE_W}:{PIPE_H}")
         vf_chain.append("hwdownload")
+        vf_chain.append(f"format={hwdownload_fmt}")
         vf_chain.append("format=bgr24")
     else:
         # CPU scale (still multi-threaded inside FFmpeg via libswscale).
@@ -593,7 +606,7 @@ def main():
             vf_chain.append(f"scale={PIPE_W}:{PIPE_H}:flags=area")
         vf_chain.append("format=bgr24")
 
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-threads", "0"]
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "warning", "-threads", "0"]
     if hw_dec:
         cmd += ["-hwaccel", "cuda"]
         if use_scale_cuda:
@@ -756,7 +769,22 @@ def main():
         pbar.close()
 
     flush_batch()
-    pipe_process.wait()
+    ffmpeg_stderr = ""
+    if pipe_process.stderr:
+        ffmpeg_stderr = pipe_process.stderr.read().decode(errors="replace").strip()
+    ffmpeg_rc = pipe_process.wait()
+
+    if ffmpeg_rc != 0:
+        print(f"[ERROR] FFmpeg extraction failed (exit code {ffmpeg_rc}).")
+        if ffmpeg_stderr:
+            print(ffmpeg_stderr)
+        return
+
+    if n_processed == 0:
+        print("[ERROR] FFmpeg produced zero frames.")
+        if ffmpeg_stderr:
+            print(ffmpeg_stderr)
+        return
 
     # ── Flush async write queue ───────────────────────────────
     if pending_writes:
@@ -782,7 +810,7 @@ def main():
 
             tmp_pattern = os.path.join(out_dir, f"_tmp_%06d{ext}")
             extract_cmd = [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "0",
+                "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-threads", "0",
             ]
             if hw_dec:
                 extract_cmd += ["-hwaccel", "cuda", "-c:v", hw_dec]
